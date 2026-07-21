@@ -1,0 +1,11 @@
+[package]
+name = "patzer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cozy-chess = "0.3.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

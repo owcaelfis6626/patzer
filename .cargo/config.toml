@@ -1,0 +1,4 @@
+# NNUE inference wants AVX2 (vpmaddwd autovectorization); node-count signatures are
+# arithmetic-exact and unaffected by codegen. Binaries are machine-local anyway.
+[build]
+rustflags = ["-C", "target-cpu=native"]
