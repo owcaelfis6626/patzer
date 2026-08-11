@@ -271,6 +271,34 @@ struct GameRecord {
 }
 
 pub fn datagen(games: usize, out_path: &str, base_seed: u64, threads: usize) {
+    run_datagen(games, out_path, base_seed, threads, None);
+}
+
+/// Same self-play pipeline, but each game starts from a position drawn from
+/// `positions_path` (one FEN per line) instead of a random balanced opening --
+/// used to seed datagen with curated "hard" positions (e.g. mine_hard_positions.py
+/// output) so training data covers tactically sharp middlegames the random
+/// walk rarely reaches.
+pub fn datagen_seeded(games: usize, out_path: &str, base_seed: u64, threads: usize, positions_path: &str) {
+    let text = std::fs::read_to_string(positions_path).expect("cannot read positions file");
+    let positions: Vec<Board> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| Board::from_fen(l.trim(), false).expect("bad FEN in positions file"))
+        .collect();
+    assert!(!positions.is_empty(), "positions file is empty");
+    eprintln!("loaded {} seed positions from {positions_path}", positions.len());
+    run_datagen(games, out_path, base_seed, threads, Some(positions));
+}
+
+fn run_datagen(
+    games: usize,
+    out_path: &str,
+    base_seed: u64,
+    threads: usize,
+    seed_positions: Option<Vec<Board>>,
+) {
+    let seed_positions = &seed_positions;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -286,6 +314,7 @@ pub fn datagen(games: usize, out_path: &str, base_seed: u64, threads: usize) {
             let writer = &writer;
             let games_done = &games_done;
             let positions = &positions;
+            let seed_positions = seed_positions;
             scope.spawn(move || {
                 let mut seed = (base_seed ^ (t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
                 let mut rng = move || {
@@ -303,8 +332,13 @@ pub fn datagen(games: usize, out_path: &str, base_seed: u64, threads: usize) {
                         break;
                     }
 
-                    // --- random balanced opening ---
-                    let board0 = loop {
+                    // --- starting position: curated seed if provided, else random balanced opening ---
+                    // seeded mode is fully deterministic given a position, so round-robin by game
+                    // index (not random sampling) guarantees full coverage with zero duplicate games
+                    let board0 = if let Some(pos_list) = seed_positions {
+                        pos_list[g % pos_list.len()].clone()
+                    } else {
+                        loop {
                         let mut b = Board::startpos();
                         let mut ok = true;
                         for _ in 0..OPENING_PLIES {
@@ -335,6 +369,7 @@ pub fn datagen(games: usize, out_path: &str, base_seed: u64, threads: usize) {
                         );
                         if searcher.last_score.abs() <= OPENING_FILTER_CP {
                             break b;
+                        }
                         }
                     };
 

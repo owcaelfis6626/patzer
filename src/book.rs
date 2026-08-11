@@ -13,9 +13,10 @@ use std::collections::HashMap;
 
 const LINES: &[(char, &str)] = &[
     // ---------------- Philidor personality (original) ----------------
-    // Philidor Defence -> Nimzovich -> LOCOCK variation. Gambit follow-ups after 4...h6
+    // Philidor Defence -> Nimzovich. (The Locock 5.Ng5 line was removed 2026-08-10:
+    // a club in-joke, not a move worth playing. Objective opening choice now comes
+    // from the result-weighted Polyglot book, not from this repertoire.)
     // deliberately NOT encoded: once out of book the engine searches.
-    ('*', "e2e4 e7e5 g1f3 d7d6 d2d4 g8f6 f3g5"),
     // Philidor, exchange line
     ('*', "e2e4 e7e5 g1f3 d7d6 d2d4 e5d4 f3d4 g8f6 b1c3 f8e7"),
     // Philidor, Nimzovich with 4.Nc3 Nbd7

@@ -3,15 +3,32 @@
 //! cozy_chess::util::{parse_uci_move, display_uci_move}.
 
 use crate::search::{Limits, Searcher};
+use crate::tt::TT;
 use cozy_chess::util::{display_uci_move, parse_uci_move};
 use cozy_chess::Board;
 use std::io::BufRead;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Build `n` Searchers sharing one TT and one stop flag (Lazy SMP) -- thread 0 is main
+/// (prints info/returns bestmove, bumps TT age); the rest search silently.
+fn build_pool(hash_mb: usize, n: usize, stop: &Arc<AtomicBool>) -> (Arc<TT>, Vec<Arc<Mutex<Searcher>>>) {
+    let tt = Arc::new(TT::new(hash_mb));
+    let pool = (0..n.max(1))
+        .map(|i| {
+            let mut s = Searcher::for_thread(tt.clone(), stop.clone(), i == 0);
+            s.silent = i != 0;
+            Arc::new(Mutex::new(s))
+        })
+        .collect();
+    (tt, pool)
+}
+
 pub fn uci_loop() {
-    let searcher = Arc::new(Mutex::new(Searcher::new(64)));
-    let stop = searcher.lock().unwrap().stop_flag();
+    let mut hash_mb: usize = 64;
+    let mut n_threads: usize = 1;
+    let stop = Arc::new(AtomicBool::new(false));
+    let (mut tt, mut pool) = build_pool(hash_mb, n_threads, &stop);
     let mut board = Board::startpos();
     let mut game_hist: Vec<u64> = Vec::new();
     let book = crate::book::Book::load().expect("book failed legality walk");
@@ -22,7 +39,7 @@ pub fn uci_loop() {
         .unwrap_or(0xC0FFEE)
         | 1;
 
-    let mut worker: Option<std::thread::JoinHandle<()>> = None;
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = match line {
@@ -35,6 +52,7 @@ pub fn uci_loop() {
                 println!("id name Patzer 0.2");
                 println!("id author Hubert Lipski");
                 println!("option name Hash type spin default 64 min 1 max 4096");
+                println!("option name Threads type spin default 1 min 1 max 256");
                 println!("option name OwnBook type check default true");
                 println!("option name EvalFile type string default <empty>");
                 println!("option name PolicyFile type string default <empty>");
@@ -49,7 +67,19 @@ pub fn uci_loop() {
                 ) {
                     if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("hash")) == Some(true) {
                         if let Some(mb) = tokens.get(vi + 1).and_then(|v| v.parse::<usize>().ok()) {
-                            *searcher.lock().unwrap() = Searcher::new(mb);
+                            hash_mb = mb;
+                            let (new_tt, new_pool) = build_pool(hash_mb, n_threads, &stop);
+                            tt = new_tt;
+                            pool = new_pool;
+                        }
+                    } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("threads"))
+                        == Some(true)
+                    {
+                        if let Some(n) = tokens.get(vi + 1).and_then(|v| v.parse::<usize>().ok()) {
+                            n_threads = n.max(1);
+                            let (new_tt, new_pool) = build_pool(hash_mb, n_threads, &stop);
+                            tt = new_tt;
+                            pool = new_pool;
                         }
                     } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("ownbook"))
                         == Some(true)
@@ -78,7 +108,7 @@ pub fn uci_loop() {
                 }
             }
             Some("ucinewgame") => {
-                searcher.lock().unwrap().tt.clear();
+                tt.clear();
             }
             Some("position") => {
                 let mut idx = 1;
@@ -143,27 +173,36 @@ pub fn uci_loop() {
                         _ => {}
                     }
                 }
-                if let Some(h) = worker.take() {
+                for h in workers.drain(..) {
                     let _ = h.join(); // previous search must have printed its bestmove
                 }
-                let searcher = searcher.clone();
-                let board = board.clone();
-                let hist = game_hist.clone();
-                worker = Some(std::thread::spawn(move || {
-                    let mut s = match searcher.try_lock() {
-                        Ok(s) => s,
-                        Err(_) => {
-                            println!("info string already searching");
-                            return;
+                stop.store(false, Ordering::Relaxed); // reset once, before any thread starts
+                for (i, s) in pool.iter().enumerate() {
+                    let s = s.clone();
+                    let board = board.clone();
+                    let hist = game_hist.clone();
+                    let limits = limits.clone();
+                    let is_main = i == 0;
+                    workers.push(std::thread::spawn(move || {
+                        let mut s = match s.try_lock() {
+                            Ok(s) => s,
+                            Err(_) => {
+                                if is_main {
+                                    println!("info string already searching");
+                                }
+                                return;
+                            }
+                        };
+                        s.game_hist = hist;
+                        let best = s.think(&board, &limits);
+                        if is_main {
+                            match best {
+                                Some(mv) => println!("bestmove {}", display_uci_move(&board, mv)),
+                                None => println!("bestmove 0000"),
+                            }
                         }
-                    };
-                    s.game_hist = hist;
-                    let best = s.think(&board, &limits);
-                    match best {
-                        Some(mv) => println!("bestmove {}", display_uci_move(&board, mv)),
-                        None => println!("bestmove 0000"),
-                    }
-                }));
+                    }));
+                }
             }
             Some("stop") => stop.store(true, Ordering::Relaxed),
             Some("quit") => break,
@@ -171,7 +210,7 @@ pub fn uci_loop() {
         }
     }
     stop.store(true, Ordering::Relaxed);
-    if let Some(h) = worker.take() {
+    for h in workers.drain(..) {
         let _ = h.join(); // let the search print bestmove before the process exits
     }
 }

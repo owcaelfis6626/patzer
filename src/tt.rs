@@ -1,9 +1,12 @@
-//! Transposition table. Fixed-size, power-of-two buckets, replace on (age differs | deeper | same key).
-//! Moves are stored packed (from 6 bits | to 6 bits | promo 3 bits); they are only ever *compared*
-//! against packed generated moves, never unpacked blind — so a corrupted move can cause a missed
-//! ordering hint, never an illegal move.
+//! Transposition table. Lock-free: two atomic words per slot (key^data, data), Relaxed
+//! ordering — the standard technique for a table probed/stored by multiple search threads
+//! without locks. A torn/racing read fails XOR-validation and is treated as a miss; it can
+//! never produce a corrupted move, since TT moves are only ever *compared* against packed
+//! generated moves, never unpacked blind (same invariant as before SMP).
+//! Fixed-size, power-of-two buckets, replace on (age differs | deeper | same key).
 
 use cozy_chess::{Move, Piece};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 pub const BOUND_NONE: u8 = 0;
 pub const BOUND_EXACT: u8 = 1;
@@ -32,54 +35,115 @@ pub struct Entry {
     pub age: u8,
 }
 
+// data word layout: mv:16 | score:16 | depth:8 | bound:8 | age:8 (56 of 64 bits used)
+fn pack_data(mv: u16, score: i16, depth: i8, bound: u8, age: u8) -> u64 {
+    (mv as u64)
+        | ((score as u16 as u64) << 16)
+        | ((depth as u8 as u64) << 32)
+        | ((bound as u64) << 40)
+        | ((age as u64) << 48)
+}
+
+fn unpack_data(data: u64) -> (u16, i16, i8, u8, u8) {
+    let mv = data as u16;
+    let score = (data >> 16) as u16 as i16;
+    let depth = (data >> 32) as u8 as i8;
+    let bound = (data >> 40) as u8;
+    let age = (data >> 48) as u8;
+    (mv, score, depth, bound, age)
+}
+
+struct Slot {
+    key_xor_data: AtomicU64,
+    data: AtomicU64,
+}
+
 pub struct TT {
-    data: Vec<Entry>,
+    slots: Vec<Slot>,
     mask: usize,
-    pub age: u8,
+    age: AtomicU8,
 }
 
 impl TT {
     pub fn new(mb: usize) -> Self {
-        let n = ((mb.max(1) << 20) / std::mem::size_of::<Entry>()).next_power_of_two() >> 1;
+        // same size_of (16 bytes) as the old plain Entry -- identical bucket count/mask at
+        // a given Hash MB setting, which is what keeps single-thread bench bit-identical.
+        let n = ((mb.max(1) << 20) / std::mem::size_of::<Slot>())
+            .next_power_of_two()
+            >> 1;
+        let n = n.max(1024);
+        let mut slots = Vec::with_capacity(n);
+        slots.resize_with(n, || Slot {
+            key_xor_data: AtomicU64::new(0),
+            data: AtomicU64::new(0),
+        });
         TT {
-            data: vec![Entry::default(); n.max(1024)],
-            mask: n.max(1024) - 1,
-            age: 0,
+            slots,
+            mask: n - 1,
+            age: AtomicU8::new(0),
         }
     }
 
-    pub fn clear(&mut self) {
-        self.data.iter_mut().for_each(|e| *e = Entry::default());
-        self.age = 0;
+    pub fn clear(&self) {
+        for s in &self.slots {
+            s.key_xor_data.store(0, Ordering::Relaxed);
+            s.data.store(0, Ordering::Relaxed);
+        }
+        self.age.store(0, Ordering::Relaxed);
     }
 
-    pub fn new_search(&mut self) {
-        self.age = self.age.wrapping_add(1);
+    pub fn new_search(&self) {
+        self.age.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn probe(&self, key: u64) -> Option<Entry> {
-        let e = self.data[(key as usize) & self.mask];
-        if e.key == key && e.bound != BOUND_NONE {
-            Some(e)
-        } else {
-            None
+        let slot = &self.slots[(key as usize) & self.mask];
+        let kx = slot.key_xor_data.load(Ordering::Relaxed);
+        let data = slot.data.load(Ordering::Relaxed);
+        if kx ^ data != key {
+            return None; // torn read or genuine miss -- either way, not a hit
         }
+        let (mv, score, depth, bound, age) = unpack_data(data);
+        if bound == BOUND_NONE {
+            return None;
+        }
+        Some(Entry {
+            key,
+            mv,
+            score,
+            depth,
+            bound,
+            age,
+        })
     }
 
-    pub fn store(&mut self, key: u64, mv: u16, score: i32, depth: i32, bound: u8) {
+    pub fn store(&self, key: u64, mv: u16, score: i32, depth: i32, bound: u8) {
         let idx = (key as usize) & self.mask;
-        let e = &mut self.data[idx];
-        if e.key != key || e.age != self.age || depth >= e.depth as i32 || bound == BOUND_EXACT {
-            // keep an existing move hint if the new one is null and the key matches
-            let mv = if mv == 0 && e.key == key { e.mv } else { mv };
-            *e = Entry {
-                key,
-                mv,
-                score: score.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
-                depth: depth.clamp(-128, 127) as i8,
-                bound,
-                age: self.age,
-            };
+        let slot = &self.slots[idx];
+        let cur_age = self.age.load(Ordering::Relaxed);
+
+        let kx = slot.key_xor_data.load(Ordering::Relaxed);
+        let old_data = slot.data.load(Ordering::Relaxed);
+        let existing_key = kx ^ old_data;
+        let (old_mv, _old_score, old_depth, _old_bound, old_age) = unpack_data(old_data);
+
+        let replace = existing_key != key
+            || old_age != cur_age
+            || depth >= old_depth as i32
+            || bound == BOUND_EXACT;
+        if !replace {
+            return;
         }
+        // keep an existing move hint if the new one is null and the key matches
+        let mv = if mv == 0 && existing_key == key {
+            old_mv
+        } else {
+            mv
+        };
+        let score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let depth = depth.clamp(-128, 127) as i8;
+        let data = pack_data(mv, score, depth, bound, cur_age);
+        slot.data.store(data, Ordering::Relaxed);
+        slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
     }
 }

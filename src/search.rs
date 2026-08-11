@@ -1,5 +1,6 @@
 //! Stage-1.5 classical search: iterative deepening, aspiration windows, PVS negamax (fail-soft),
 //! transposition table, quiescence with in-check evasions + SEE pruning, null-move pruning,
+//! late move pruning (move-count schedule widened when "improving"),
 //! reverse futility, LMR, ordering = TT move > SEE-winning captures (MVV-LVA) > queen promos >
 //! killers > countermove > (butterfly history + continuation history) > SEE-losing captures.
 //! Continuation history (Stage 4): (piece,to) of the 1-ply and 2-ply predecessors index a
@@ -22,6 +23,10 @@ pub const INF: i32 = 32_500;
 const MATE_BOUND: i32 = MATE - 512;
 const MAX_PLY: usize = 128;
 const CONT_PT: usize = 6 * 64; // continuation-history (piece,to) index space = 384
+const LMP_MAX_DEPTH: i32 = 8; // above this the move-count schedule is too blunt to be safe
+const IIR_MIN_DEPTH: i32 = 4; // 0 disables internal iterative reduction
+const SE_MIN_DEPTH: i32 = 0;  // 0 disables singular extensions
+const LMR_TWEAKS: bool = true; // PV/improving adjustments to the LMR reduction
 const NULL_CONT: usize = usize::MAX; // sentinel: no continuation across a null move
 
 fn opp(c: Color) -> Color {
@@ -144,7 +149,10 @@ pub struct Limits {
 }
 
 pub struct Searcher {
-    pub tt: TT,
+    pub tt: Arc<TT>,
+    // true for exactly one thread per `go` (the one that prints `info`/returns bestmove and
+    // bumps the TT age once); SMP helper threads share the same tt+stop but are not main.
+    is_main: bool,
     killers: [[u16; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     counter: [[[u16; 64]; 64]; 2], // [stm][prev.from][prev.to] -> packed countermove
@@ -152,6 +160,11 @@ pub struct Searcher {
     // [prev_piece*64+prev_to][cur_piece*64+cur_to]; flat to avoid a large on-stack array.
     cont: Vec<i32>,
     cont_stack: Vec<usize>, // (piece,to) index of each move on the path; NULL_CONT for null moves
+    // static eval per ply, so a node can ask whether the side to move is better off than it
+    // was two plies ago ("improving"). Used to widen the late-move-pruning schedule.
+    eval_hist: [i32; MAX_PLY],
+    // move excluded at each ply during a singular-verification search (0 = none)
+    excluded: [u16; MAX_PLY],
     pub nodes: u64,
     seldepth: i32,
     start: Instant,
@@ -168,30 +181,36 @@ pub struct Searcher {
 
 impl Searcher {
     pub fn new(hash_mb: usize) -> Self {
+        Self::for_thread(Arc::new(TT::new(hash_mb)), Arc::new(AtomicBool::new(false)), true)
+    }
+
+    /// Build a Searcher sharing an existing TT + stop flag with other threads (Lazy SMP).
+    /// Exactly one thread in a group should be `is_main` -- it alone bumps the TT age and
+    /// prints `info`/returns the bestmove; helpers search silently to populate the shared TT.
+    pub fn for_thread(tt: Arc<TT>, stop: Arc<AtomicBool>, is_main: bool) -> Self {
         Searcher {
-            tt: TT::new(hash_mb),
+            tt,
+            is_main,
             killers: [[0; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             counter: [[[0; 64]; 64]; 2],
             cont: vec![0i32; 2 * CONT_PT * CONT_PT],
             cont_stack: Vec::with_capacity(MAX_PLY + 4),
+            eval_hist: [0; MAX_PLY],
+            excluded: [0; MAX_PLY],
             nodes: 0,
             seldepth: 0,
             start: Instant::now(),
             soft_ms: u128::MAX,
             hard_ms: u128::MAX,
             max_nodes: u64::MAX,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
             stopped: false,
             path: Vec::with_capacity(MAX_PLY + 4),
             game_hist: Vec::new(),
             silent: false,
             last_score: 0,
         }
-    }
-
-    pub fn stop_flag(&self) -> Arc<AtomicBool> {
-        self.stop.clone()
     }
 
     fn check_stop(&mut self) -> bool {
@@ -369,21 +388,52 @@ impl Searcher {
 
         // TT probe
         let mut tt_mv: u16 = 0;
-        if let Some(e) = self.tt.probe(hash) {
-            tt_mv = e.mv;
-            if ply > 0 && e.depth as i32 >= depth {
-                let sc = tt_score_from(e.score as i32, ply);
-                match e.bound {
-                    BOUND_EXACT => return sc,
-                    BOUND_LOWER if sc >= beta => return sc,
-                    BOUND_UPPER if sc <= alpha => return sc,
-                    _ => {}
+        // A move excluded at this node means we are inside a singular-verification search: the
+        // position is being searched WITHOUT its best move, so it is not the same search problem
+        // as the plain position. Probing or storing under `hash` would cross-contaminate the two,
+        // so both are skipped for the duration.
+        let excl = self.excluded[ply as usize];
+
+        let mut tt_depth: i32 = -1;
+        let mut tt_score: i32 = 0;
+        let mut tt_bound: u8 = 0;
+        if excl == 0 {
+            if let Some(e) = self.tt.probe(hash) {
+                tt_mv = e.mv;
+                tt_depth = e.depth as i32;
+                tt_score = tt_score_from(e.score as i32, ply);
+                tt_bound = e.bound;
+                if ply > 0 && e.depth as i32 >= depth {
+                    let sc = tt_score_from(e.score as i32, ply);
+                    match e.bound {
+                        BOUND_EXACT => return sc,
+                        BOUND_LOWER if sc >= beta => return sc,
+                        BOUND_UPPER if sc <= alpha => return sc,
+                        _ => {}
+                    }
                 }
             }
         }
 
+        // Internal iterative reduction: with no TT move the ordering here is only history/policy,
+        // so a full-depth search is poor value -- searching one ply shallower fills the TT with a
+        // best move, and the next visit to this node gets it properly ordered. Cheaper than a real
+        // internal iterative deepening re-search.
+        if IIR_MIN_DEPTH > 0 && depth >= IIR_MIN_DEPTH && tt_mv == 0 {
+            depth -= 1;
+        }
+
         let stm = board.side_to_move();
         let static_eval = self.eval_node(board, acc);
+        self.eval_hist[ply as usize] = static_eval;
+
+        let is_pv = beta - alpha > 1;
+        // "improving": the side to move stands better than it did two plies ago, so this line is
+        // going our way and late quiets deserve a longer look before being pruned. Meaningless
+        // while in check (the static eval of a check position says nothing), so force it false.
+        let improving = !in_check
+            && ply >= 2
+            && static_eval > self.eval_hist[ply as usize - 2];
 
         // reverse futility pruning
         if !in_check && ply > 0 && depth <= 6 && static_eval - 120 * depth >= beta {
@@ -496,9 +546,66 @@ impl Searcher {
         let mut bound = BOUND_UPPER;
         let mut quiets_tried: Vec<Move> = Vec::new();
 
+        // Late-move-pruning schedule: how many quiets are worth searching at this depth before
+        // the remainder -- which the ordering has already ranked worst -- are written off.
+        // Doubled when improving, since a line that is going our way deserves the longer look.
+        let lmp_limit = ((3 + depth * depth) / if improving { 1 } else { 2 }) as usize;
+
         for (i, &(_, mv)) in moves.iter().enumerate() {
+            let packed_mv = pack(mv);
+            if packed_mv == excl {
+                continue; // singular verification: this node is searched without its best move
+            }
             let is_capture = board.color_on(mv.to) == Some(opp(stm));
             let is_quiet = !is_capture && mv.promotion.is_none();
+
+            // Late move pruning. Once `lmp_limit` quiets have been searched without beating
+            // alpha, the rest are very unlikely to, so skip them -- before the board clone and
+            // accumulator update, which is where the saving actually comes from. `quiets_tried`
+            // counts only quiets that were *searched*, so once the limit is hit it stops growing
+            // and every later quiet is pruned too. Never in a PV node, never in check, and never
+            // while we are getting mated (there every defensive resource still has to be seen).
+            if !is_pv
+                && !in_check
+                && is_quiet
+                && depth <= LMP_MAX_DEPTH
+                && best > -MATE_BOUND
+                && quiets_tried.len() >= lmp_limit
+            {
+                continue;
+            }
+
+            // Singular extension. If the TT says this move is good enough to have caused a
+            // fail-high at nearly this depth, ask whether it is the ONLY move that does: search
+            // every other move at reduced depth against a window just below the TT score. If they
+            // all fail low the move is singular -- the line hinges on it -- so it is worth an
+            // extra ply. Requires `excl == 0`: inside a verification search the test must not
+            // recurse, and the TT fields it reads were not probed there anyway.
+            let mut extension = 0i32;
+            if SE_MIN_DEPTH > 0
+                && ply > 0
+                && excl == 0
+                && depth >= SE_MIN_DEPTH
+                && packed_mv == tt_mv
+                && tt_mv != 0
+                && tt_depth >= depth - 3
+                && tt_bound != BOUND_UPPER
+                && tt_score.abs() < MATE_BOUND
+            {
+                let s_beta = tt_score - 3 * depth;
+                let s_depth = (depth - 1) / 2;
+                self.excluded[ply as usize] = tt_mv;
+                let s = self.negamax(board, s_depth, ply, s_beta - 1, s_beta, prev, acc);
+                self.excluded[ply as usize] = 0;
+                if self.stopped {
+                    return 0; // no move searched yet at this point, so nothing to preserve
+                }
+                if s < s_beta {
+                    extension = 1;
+                }
+            }
+            let new_depth = depth - 1 + extension;
+
             // continuation-history index of the move being played (any move, capture or quiet)
             let cur_ci = board.piece_on(mv.from).unwrap() as usize * 64 + mv.to as usize;
             let mut nb = board.clone();
@@ -509,20 +616,28 @@ impl Searcher {
             self.cont_stack.push(cur_ci);
 
             let sc = if i == 0 {
-                -self.negamax(&nb, depth - 1, ply + 1, -beta, -alpha, pack(mv), na)
+                -self.negamax(&nb, new_depth, ply + 1, -beta, -alpha, pack(mv), na)
             } else {
                 // LMR on late quiets
                 let mut r = 0i32;
                 if depth >= 3 && i >= 3 && is_quiet && !in_check {
                     r = lmr_table()[depth.min(63) as usize][i.min(63)] as i32;
+                    if LMR_TWEAKS {
+                        // A PV node is worth searching more carefully; a line that is not
+                        // improving is worth searching less. Both quantities are already
+                        // computed for LMP, so this costs nothing.
+                        r -= is_pv as i32;
+                        r += !improving as i32;
+                        r = r.max(0);
+                    }
                 }
                 let mut s =
-                    -self.negamax(&nb, depth - 1 - r, ply + 1, -alpha - 1, -alpha, pack(mv), na);
+                    -self.negamax(&nb, new_depth - r, ply + 1, -alpha - 1, -alpha, pack(mv), na);
                 if s > alpha && r > 0 {
-                    s = -self.negamax(&nb, depth - 1, ply + 1, -alpha - 1, -alpha, pack(mv), na);
+                    s = -self.negamax(&nb, new_depth, ply + 1, -alpha - 1, -alpha, pack(mv), na);
                 }
                 if s > alpha && s < beta {
-                    s = -self.negamax(&nb, depth - 1, ply + 1, -beta, -alpha, pack(mv), na);
+                    s = -self.negamax(&nb, new_depth, ply + 1, -beta, -alpha, pack(mv), na);
                 }
                 s
             };
@@ -575,8 +690,11 @@ impl Searcher {
             }
         }
 
-        self.tt
-            .store(hash, best_mv, tt_score_to(best, ply), depth, bound);
+        // never store a verification search: its score is for the position MINUS one move
+        if excl == 0 {
+            self.tt
+                .store(hash, best_mv, tt_score_to(best, ply), depth, bound);
+        }
         best
     }
 
@@ -589,7 +707,10 @@ impl Searcher {
         self.path.clear();
         self.cont_stack.clear();
         self.killers = [[0; 2]; MAX_PLY];
-        self.tt.new_search();
+        // only the main thread of an SMP group bumps age -- once per `go`, not once per thread
+        if self.is_main {
+            self.tt.new_search();
+        }
 
         // time budget
         self.max_nodes = limits.nodes.unwrap_or(u64::MAX);
@@ -702,9 +823,12 @@ impl Searcher {
         let mut b = board.clone();
         let mut seen: Vec<u64> = Vec::new();
         for _ in 0..max_len {
-            // stop at any repetition w.r.t. PV-internal or game history (display only;
-            // avoids emitting PV moves past a threefold, which match runners flag)
-            if seen.contains(&b.hash()) || self.game_hist.contains(&b.hash()) {
+            // stop at any repetition w.r.t. PV-internal or game history, or at the
+            // fifty-move mark (display only; avoids emitting PV moves past a drawn
+            // position, which match runners flag)
+            if seen.contains(&b.hash()) || self.game_hist.contains(&b.hash())
+                || b.halfmove_clock() >= 100
+            {
                 break;
             }
             seen.push(b.hash());

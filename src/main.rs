@@ -68,6 +68,16 @@ fn main() {
             let threads = args.get(5).and_then(|n| n.parse().ok()).unwrap_or(4);
             datagen::datagen(games, &out, seed, threads);
         }
+        Some("datagenseeded") => {
+            // datagenseeded <games> <out.bin> <positions.epd> [seed] [threads]
+            let args: Vec<String> = std::env::args().collect();
+            let games = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(1000);
+            let out = args.get(3).cloned().unwrap_or_else(|| "data.bin".into());
+            let positions = args.get(4).expect("usage: datagenseeded <games> <out.bin> <positions.epd> [seed] [threads]");
+            let seed = args.get(5).and_then(|n| n.parse().ok()).unwrap_or(0xDA7A);
+            let threads = args.get(6).and_then(|n| n.parse().ok()).unwrap_or(4);
+            datagen::datagen_seeded(games, &out, seed, threads, positions);
+        }
         _ => uci::uci_loop(),
     }
 }
