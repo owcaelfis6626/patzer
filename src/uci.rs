@@ -31,6 +31,8 @@ pub fn uci_loop() {
     let (mut tt, mut pool) = build_pool(hash_mb, n_threads, &stop);
     let mut board = Board::startpos();
     let mut game_hist: Vec<u64> = Vec::new();
+    // this side's own root scores across the game, for volatility-aware time management
+    let mut eval_hist_game: Vec<i32> = Vec::new();
     let book = crate::book::Book::load().expect("book failed legality walk");
     let mut own_book = true;
     let mut book_seed: u64 = std::time::SystemTime::now()
@@ -131,6 +133,7 @@ pub fn uci_loop() {
                     idx = end;
                 }
                 game_hist.clear();
+                eval_hist_game.clear();
                 if tokens.get(idx) == Some(&"moves") {
                     for mv_str in &tokens[idx + 1..] {
                         match parse_uci_move(&board, mv_str) {
@@ -173,14 +176,26 @@ pub fn uci_loop() {
                         _ => {}
                     }
                 }
+                let had_prev = !workers.is_empty();
                 for h in workers.drain(..) {
                     let _ = h.join(); // previous search must have printed its bestmove
+                }
+                // Record the previous search's root score for volatility-aware time
+                // management. Safe here and only here: the join above guarantees that search
+                // has finished, so no extra synchronisation is needed. These are all THIS
+                // side's own scores, from its own perspective, which is exactly the per-side
+                // sequence the AUC 0.81 measurement was made on.
+                if had_prev {
+                    if let Ok(s0) = pool[0].lock() {
+                        eval_hist_game.push(s0.last_score);
+                    }
                 }
                 stop.store(false, Ordering::Relaxed); // reset once, before any thread starts
                 for (i, s) in pool.iter().enumerate() {
                     let s = s.clone();
                     let board = board.clone();
                     let hist = game_hist.clone();
+                    let evh = eval_hist_game.clone();
                     let limits = limits.clone();
                     let is_main = i == 0;
                     workers.push(std::thread::spawn(move || {
@@ -194,6 +209,7 @@ pub fn uci_loop() {
                             }
                         };
                         s.game_hist = hist;
+                        s.eval_hist_game = evh;
                         let best = s.think(&board, &limits);
                         if is_main {
                             match best {

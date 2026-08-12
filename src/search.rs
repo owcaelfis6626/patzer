@@ -29,6 +29,40 @@ const SE_MIN_DEPTH: i32 = 0;  // 0 disables singular extensions
 const LMR_TWEAKS: bool = true; // PV/improving adjustments to the LMR reduction
 const NULL_CONT: usize = usize::MAX; // sentinel: no continuation across a null move
 
+// Correction history. The static eval is systematically wrong in whole CLASSES of position --
+// a structure the net habitually over- or under-rates -- and the search discovers this every
+// time it returns a score far from the eval it started with. That discrepancy is thrown away
+// today. Here it is recorded against the pawn structure (which is what makes two positions
+// "the same kind of position") and added back to the static eval next time.
+//
+// Indexed by pawn structure ONLY, deliberately: it has to generalise across positions that
+// share a character, so a full board key would never hit twice. Costs one hash + one array
+// read per node -- unlike the accumulator this sits BESIDE the net, so it does not disturb
+// incremental updates.
+const CORR_HIST: bool = false; // correction history on the static eval
+const CORR_SIZE: usize = 16_384; // 2^14 pawn-structure buckets per side
+const CORR_GRAIN: i32 = 256; // entries kept in 1/256 pawn units so the EMA stays smooth in i32
+const CORR_MAX: i32 = 128 * CORR_GRAIN; // never shift the eval by more than ~128cp
+const CORR_W: i32 = 16; // EMA horizon; a single sample can take at most half the entry
+const CORR_W_MAX: i32 = CORR_W / 2;
+
+// Volatility-aware time management. Measured on 1,018,380 samples from the self-play PGN
+// corpus (games/jump_test.py): windowed realised eval volatility predicts the size of the
+// NEXT eval jump at AUC 0.81, and adding depth / time / |eval| on top lifts that only to
+// 0.82 -- past volatility is essentially the whole signal, so no learned head is needed.
+// VOL_W recent own-side root scores are averaged; the soft time limit is scaled between
+// VOL_MIN and VOL_MAX as that average runs from VOL_LO to VOL_HI pawns.
+//
+// The bench signature CANNOT gate this: bench runs at fixed depth, so time management never
+// engages and the signature is identical with the toggle on and off. `search::vol_tm_tests`
+// is the gate instead.
+const VOL_TM: bool = false;
+const VOL_W: usize = 8;
+const VOL_LO: f64 = 0.10; // pawns: calm
+const VOL_HI: f64 = 0.60; // pawns: the corpus's "big jump" tertile boundary was 0.65
+const VOL_MIN: f64 = 0.80; // spend 20% less when the eval has been flat
+const VOL_MAX: f64 = 1.60; // spend 60% more when it has been swinging
+
 fn opp(c: Color) -> Color {
     match c {
         Color::White => Color::Black,
@@ -165,6 +199,9 @@ pub struct Searcher {
     eval_hist: [i32; MAX_PLY],
     // move excluded at each ply during a singular-verification search (0 = none)
     excluded: [u16; MAX_PLY],
+    // correction history: [stm][pawn-structure bucket] -> learned static-eval offset, in
+    // 1/CORR_GRAIN pawn units. Heap-allocated: 2*16384 i32 is 128 KB, too big for the stack.
+    corr: Vec<i32>,
     pub nodes: u64,
     seldepth: i32,
     start: Instant,
@@ -175,6 +212,8 @@ pub struct Searcher {
     stopped: bool,
     path: Vec<u64>,
     pub game_hist: Vec<u64>,
+    /// This side's own root scores across the game, oldest first (volatility time management)
+    pub eval_hist_game: Vec<i32>,
     pub silent: bool,
     pub last_score: i32, // score of the last completed ID iteration (stm perspective)
 }
@@ -195,6 +234,7 @@ impl Searcher {
             history: [[[0; 64]; 64]; 2],
             counter: [[[0; 64]; 64]; 2],
             cont: vec![0i32; 2 * CONT_PT * CONT_PT],
+            corr: vec![0i32; 2 * CORR_SIZE],
             cont_stack: Vec::with_capacity(MAX_PLY + 4),
             eval_hist: [0; MAX_PLY],
             excluded: [0; MAX_PLY],
@@ -208,6 +248,7 @@ impl Searcher {
             stopped: false,
             path: Vec::with_capacity(MAX_PLY + 4),
             game_hist: Vec::new(),
+            eval_hist_game: Vec::new(),
             silent: false,
             last_score: 0,
         }
@@ -239,6 +280,70 @@ impl Searcher {
             Some(a) => nnue::forward(nnue::net().unwrap(), &a.w, &a.b, board.side_to_move()),
             None => evaluate(board),
         }
+    }
+
+    /// Bucket for correction history: the pawn structure, and nothing else.
+    ///
+    /// The two pawn bitboards DETERMINE the structure exactly, so they are hashed directly
+    /// rather than walked square by square -- this is O(1), which matters at 1.7 M nodes/s.
+    /// (A Zobrist-style incremental key would need threading through make/unmake; the board
+    /// here is rebuilt per node, so there is nothing to thread.) splitmix64 finalizer, because
+    /// raw bitboards have terrible low-bit entropy and the index is a mask of the low bits.
+    fn corr_index(board: &Board, stm: Color) -> usize {
+        let p = board.pieces(Piece::Pawn);
+        let w = (p & board.colors(Color::White)).0;
+        let b = (p & board.colors(Color::Black)).0;
+        let mut x = w
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ b.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 31;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 29;
+        (stm as usize) * CORR_SIZE + (x as usize & (CORR_SIZE - 1))
+    }
+
+    /// Static eval plus whatever the search has learned about this pawn structure.
+    fn corrected_eval(&self, board: &Board, stm: Color, raw: i32) -> i32 {
+        if !CORR_HIST {
+            return raw;
+        }
+        raw + self.corr[Self::corr_index(board, stm)] / CORR_GRAIN
+    }
+
+    /// Fold one search result into the correction for this structure.
+    ///
+    /// Guards, all of which matter:
+    ///  * not in check -- the static eval is meaningless there, so the difference is noise;
+    ///  * best move is not a capture -- that difference is material the eval already saw
+    ///    change, not a standing bias in how this structure is judged;
+    ///  * the bound has to point the right way. A fail-high only proves `best` is a LOWER
+    ///    bound, so it is evidence the eval was too low and evidence of nothing at all if the
+    ///    eval was already higher. Symmetrically for fail-low. Without this the table learns
+    ///    from bounds that never constrained anything.
+    fn update_corr(
+        &mut self,
+        board: &Board,
+        stm: Color,
+        static_eval: i32,
+        best: i32,
+        bound: u8,
+        depth: i32,
+        best_is_capture: bool,
+    ) {
+        if !CORR_HIST || best_is_capture || best.abs() >= MATE_BOUND {
+            return;
+        }
+        if (bound == BOUND_LOWER && best <= static_eval)
+            || (bound == BOUND_UPPER && best >= static_eval)
+        {
+            return;
+        }
+        let w = depth.clamp(1, CORR_W_MAX);
+        let target = (best - static_eval).clamp(-CORR_MAX / CORR_GRAIN, CORR_MAX / CORR_GRAIN)
+            * CORR_GRAIN;
+        let e = &mut self.corr[Self::corr_index(board, stm)];
+        *e = (*e * (CORR_W - w) + target * w) / CORR_W;
+        *e = (*e).clamp(-CORR_MAX, CORR_MAX);
     }
 
     // ---------------- quiescence ----------------
@@ -424,7 +529,11 @@ impl Searcher {
         }
 
         let stm = board.side_to_move();
-        let static_eval = self.eval_node(board, acc);
+        let raw_eval = self.eval_node(board, acc);
+        // Everything downstream -- improving, reverse futility, null move, LMP -- reads the
+        // CORRECTED eval. That is the point: the corrections are only worth anything if they
+        // reach the pruning decisions the static eval drives.
+        let static_eval = self.corrected_eval(board, stm, raw_eval);
         self.eval_hist[ply as usize] = static_eval;
 
         let is_pv = beta - alpha > 1;
@@ -543,6 +652,7 @@ impl Searcher {
 
         let mut best = -INF;
         let mut best_mv: u16 = 0;
+        let mut best_is_capture = false;
         let mut bound = BOUND_UPPER;
         let mut quiets_tried: Vec<Move> = Vec::new();
 
@@ -650,6 +760,7 @@ impl Searcher {
             if sc > best {
                 best = sc;
                 best_mv = pack(mv);
+                best_is_capture = is_capture;
                 if sc > alpha {
                     alpha = sc;
                     bound = BOUND_EXACT;
@@ -694,8 +805,30 @@ impl Searcher {
         if excl == 0 {
             self.tt
                 .store(hash, best_mv, tt_score_to(best, ply), depth, bound);
+            // same exclusion, same reason: a verification score describes a different position,
+            // and `in_check` is already known false here (checks went to qsearch at the top).
+            if !in_check {
+                self.update_corr(board, stm, static_eval, best, bound, depth, best_is_capture);
+            }
         }
         best
+    }
+
+    /// Mean |delta| of this side's recent root scores, in pawns. `None` until there are
+    /// enough moves to measure -- we never guess from one or two points.
+    fn recent_volatility(&self) -> Option<f64> {
+        let h = &self.eval_hist_game;
+        if h.len() < 3 {
+            return None;
+        }
+        let n = h.len().min(VOL_W + 1);
+        let w = &h[h.len() - n..];
+        let mut acc = 0.0;
+        for i in 1..w.len() {
+            // clamp per-step: a single mate-score flip must not dominate the mean
+            acc += ((w[i] - w[i - 1]).abs() as f64 / 100.0).min(5.0);
+        }
+        Some(acc / (w.len() - 1) as f64)
     }
 
     // ---------------- iterative deepening driver ----------------
@@ -728,6 +861,22 @@ impl Searcher {
                 }
                 None => (u128::MAX, u128::MAX),
             }
+        };
+        // Scale the soft limit by how much this side's eval has been moving lately: think
+        // longer when the game is sharp, shorter when it is quiet. The hard limit is left
+        // alone -- it is the safety net against flagging and must not stretch, so the scaled
+        // soft limit is clamped to it.
+        let soft = if VOL_TM && !limits.infinite && limits.movetime.is_none() {
+            match self.recent_volatility() {
+                Some(v) => {
+                    let x = ((v - VOL_LO) / (VOL_HI - VOL_LO)).clamp(0.0, 1.0);
+                    let f = VOL_MIN + x * (VOL_MAX - VOL_MIN);
+                    (((soft as f64) * f) as u128).min(hard)
+                }
+                None => soft,
+            }
+        } else {
+            soft
         };
         self.soft_ms = if limits.infinite { u128::MAX } else { soft };
         self.hard_ms = if limits.infinite { u128::MAX } else { hard };
@@ -872,5 +1021,67 @@ fn tt_score_from(s: i32, ply: i32) -> i32 {
         s + ply
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod vol_tm_tests {
+    use super::*;
+
+    fn searcher_with(hist: Vec<i32>) -> Searcher {
+        let mut s = Searcher::new(1);
+        s.eval_hist_game = hist;
+        s
+    }
+
+    /// The bench signature runs at FIXED DEPTH, so it never engages time management and is
+    /// blind to this feature. These tests are the gate instead.
+
+    #[test]
+    fn too_short_a_history_declines_to_guess() {
+        assert_eq!(searcher_with(vec![]).recent_volatility(), None);
+        assert_eq!(searcher_with(vec![10]).recent_volatility(), None);
+        assert_eq!(searcher_with(vec![10, 20]).recent_volatility(), None);
+        // three points = two deltas is the first measurable case
+        assert!(searcher_with(vec![10, 20, 30]).recent_volatility().is_some());
+    }
+
+    #[test]
+    fn volatility_is_mean_abs_delta_in_pawns() {
+        // deltas of 50cp and 150cp -> mean 100cp -> 1.0 pawns
+        let v = searcher_with(vec![0, 50, 200]).recent_volatility().unwrap();
+        assert!((v - 1.0).abs() < 1e-9, "got {v}");
+        // a flat eval is zero volatility
+        let v = searcher_with(vec![30, 30, 30, 30]).recent_volatility().unwrap();
+        assert!(v.abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn a_single_mate_flip_cannot_dominate() {
+        // one 320-pawn jump clamps to 5.0 pawns, so the mean stays bounded
+        let v = searcher_with(vec![0, 0, 32000]).recent_volatility().unwrap();
+        assert!(v <= 2.5 + 1e-9, "mate flip leaked through: {v}");
+    }
+
+    #[test]
+    fn window_is_bounded_by_vol_w() {
+        // ancient history must not matter: a long calm tail after old chaos reads calm
+        let mut h = vec![0, 30000];
+        h.extend(std::iter::repeat(500).take(VOL_W + 4));
+        let v = searcher_with(h).recent_volatility().unwrap();
+        assert!(v.abs() < 1e-9, "window not truncated to VOL_W: {v}");
+    }
+
+    #[test]
+    fn scaling_factor_spans_min_to_max_and_clamps() {
+        let f = |v: f64| {
+            let x = ((v - VOL_LO) / (VOL_HI - VOL_LO)).clamp(0.0, 1.0);
+            VOL_MIN + x * (VOL_MAX - VOL_MIN)
+        };
+        assert!((f(0.0) - VOL_MIN).abs() < 1e-9); // calmer than LO -> clamped
+        assert!((f(VOL_LO) - VOL_MIN).abs() < 1e-9);
+        assert!((f(VOL_HI) - VOL_MAX).abs() < 1e-9);
+        assert!((f(99.0) - VOL_MAX).abs() < 1e-9); // wilder than HI -> clamped
+        assert!(f(0.35) > VOL_MIN && f(0.35) < VOL_MAX); // monotone in between
     }
 }
