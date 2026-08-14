@@ -25,7 +25,7 @@ const MAX_PLY: usize = 128;
 const CONT_PT: usize = 6 * 64; // continuation-history (piece,to) index space = 384
 const LMP_MAX_DEPTH: i32 = 8; // above this the move-count schedule is too blunt to be safe
 const IIR_MIN_DEPTH: i32 = 4; // 0 disables internal iterative reduction
-const SE_MIN_DEPTH: i32 = 0;  // 0 disables singular extensions
+const SE_MIN_DEPTH: i32 = 6;  // promoted 2026-08-14: +25.08+-13.78 @20+0.2 (H1), +26.11+-17.85 @60+0.6
 const LMR_TWEAKS: bool = true; // PV/improving adjustments to the LMR reduction
 const NULL_CONT: usize = usize::MAX; // sentinel: no continuation across a null move
 
