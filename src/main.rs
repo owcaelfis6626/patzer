@@ -56,6 +56,28 @@ fn main() {
             &std::env::args().nth(2).expect("usage: evalbin <in.bin> <out.i16>"),
             &std::env::args().nth(3).expect("usage: evalbin <in.bin> <out.i16>"),
         ),
+        Some("rescore") => {
+            // rescore <in.bin> <out.bin> [threads] [limit]  -- relabel foreign positions with
+            // our own search; see datagen::rescore for why the wdl field is left alone.
+            let a: Vec<String> = std::env::args().collect();
+            datagen::rescore(
+                a.get(2).expect("usage: rescore <in.bin> <out.bin> [threads] [limit]"),
+                a.get(3).expect("usage: rescore <in.bin> <out.bin> [threads] [limit]"),
+                a.get(4).and_then(|n| n.parse().ok()).unwrap_or(4),
+                a.get(5).and_then(|n| n.parse().ok()).unwrap_or(0),
+            );
+        }
+        Some("nnueevalbin") => {
+            // nnueevalbin <in.bin> <out.i16> <net.nnue> [limit]
+            let a: Vec<String> = std::env::args().collect();
+            let net = a.get(4).expect("usage: nnueevalbin <in.bin> <out.i16> <net.nnue> [limit]");
+            crate::nnue::load_global(net).expect("cannot load net");
+            datagen::nnueevalbin(
+                a.get(2).expect("usage: nnueevalbin <in.bin> <out.i16> <net.nnue> [limit]"),
+                a.get(3).expect("usage: nnueevalbin <in.bin> <out.i16> <net.nnue> [limit]"),
+                a.get(5).and_then(|n| n.parse().ok()).unwrap_or(0),
+            );
+        }
         Some("datacheck") => datagen::datacheck(
             &std::env::args().nth(2).expect("usage: datacheck <file.bin>"),
         ),

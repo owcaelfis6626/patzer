@@ -9,3 +9,8 @@ cozy-chess = "0.3.4"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[features]
+# Exposes the search constants as UCI options for SPSA. NOT for release builds:
+# it adds a runtime load per use and rebuilds the LMR table when parameters change.
+tune = []

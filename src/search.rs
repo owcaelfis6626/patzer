@@ -43,6 +43,18 @@ const CORR_HIST: bool = false; // correction history on the static eval
 const CORR_SIZE: usize = 16_384; // 2^14 pawn-structure buckets per side
 const CORR_GRAIN: i32 = 256; // entries kept in 1/256 pawn units so the EMA stays smooth in i32
 const CORR_MAX: i32 = 128 * CORR_GRAIN; // never shift the eval by more than ~128cp
+// Apply the correction at the qsearch stand-pat as well as in negamax.
+//
+// WHY THIS IS A SEPARATE TOGGLE. CORR_HIST measured +6.41 +- 13.29 over 1300 games -- a null,
+// but with an identified hole: the correction was applied in negamax ONLY, and most nodes in
+// this search are qsearch nodes, so most static evals never saw it. That makes the null a
+// verdict on the deployment, not on the technique.
+//
+// APPLY, BUT DO NOT UPDATE. qsearch has no meaningful depth -- the EMA weight is depth-scaled
+// (`w = depth.clamp(1, CORR_W_MAX)`) and every qsearch sample would enter at weight 1 while
+// being the least reliable evidence available. So the table is still learned from negamax
+// nodes only, and merely consulted more often.
+const CORR_QSEARCH: bool = false;
 const CORR_W: i32 = 16; // EMA horizon; a single sample can take at most half the entry
 const CORR_W_MAX: i32 = CORR_W / 2;
 
@@ -62,6 +74,73 @@ const VOL_LO: f64 = 0.10; // pawns: calm
 const VOL_HI: f64 = 0.60; // pawns: the corpus's "big jump" tertile boundary was 0.65
 const VOL_MIN: f64 = 0.80; // spend 20% less when the eval has been flat
 const VOL_MAX: f64 = 1.60; // spend 60% more when it has been swinging
+
+// ---------------------------------------------------------------- tunable parameters
+// These six constants govern how aggressively the search prunes, and none of them has ever
+// been measured -- they are the values that happened to work when each feature was written.
+// Tuning them needs the engine to vary them at RUNTIME (SPSA changes parameters every few
+// games; a rebuild per iteration would make it hopeless), but a runtime read in the hot path
+// would cost nps in the shipped binary.
+//
+// So: behind `--features tune` they become atomics settable over UCI. In a normal build they
+// stay `const`, the accessors inline away to literals, and the bench signature is unchanged
+// (795654). Tuned values get written back as constants afterwards -- the tune build is a
+// measuring instrument, not something that ships.
+#[cfg(not(feature = "tune"))]
+pub mod tune {
+    pub const RFP_MARGIN: i32 = 120;   // reverse-futility margin per ply
+    pub const NMP_BASE: i32 = 3;       // null-move reduction, constant part
+    pub const NMP_DIV: i32 = 5;        // null-move reduction, depth divisor
+    pub const LMP_BASE: i32 = 3;       // late-move-pruning schedule offset
+    pub const LMR_BASE: i32 = 75;      // LMR table intercept, x100
+    pub const LMR_DIV: i32 = 225;      // LMR table divisor, x100
+    #[inline(always)] pub fn rfp_margin() -> i32 { RFP_MARGIN }
+    #[inline(always)] pub fn nmp_base() -> i32 { NMP_BASE }
+    #[inline(always)] pub fn nmp_div() -> i32 { NMP_DIV }
+    #[inline(always)] pub fn lmp_base() -> i32 { LMP_BASE }
+    #[inline(always)] pub fn lmr_base() -> i32 { LMR_BASE }
+    #[inline(always)] pub fn lmr_div() -> i32 { LMR_DIV }
+}
+
+#[cfg(feature = "tune")]
+pub mod tune {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    pub static RFP_MARGIN: AtomicI32 = AtomicI32::new(120);
+    pub static NMP_BASE: AtomicI32 = AtomicI32::new(3);
+    pub static NMP_DIV: AtomicI32 = AtomicI32::new(5);
+    pub static LMP_BASE: AtomicI32 = AtomicI32::new(3);
+    pub static LMR_BASE: AtomicI32 = AtomicI32::new(75);
+    pub static LMR_DIV: AtomicI32 = AtomicI32::new(225);
+    #[inline] pub fn rfp_margin() -> i32 { RFP_MARGIN.load(Ordering::Relaxed) }
+    #[inline] pub fn nmp_base() -> i32 { NMP_BASE.load(Ordering::Relaxed) }
+    #[inline] pub fn nmp_div() -> i32 { NMP_DIV.load(Ordering::Relaxed).max(1) }
+    #[inline] pub fn lmp_base() -> i32 { LMP_BASE.load(Ordering::Relaxed) }
+    #[inline] pub fn lmr_base() -> i32 { LMR_BASE.load(Ordering::Relaxed) }
+    #[inline] pub fn lmr_div() -> i32 { LMR_DIV.load(Ordering::Relaxed).max(1) }
+
+    /// (uci name, default, min, max) -- the driver reads this to build its parameter set.
+    pub const PARAMS: &[(&str, i32, i32, i32)] = &[
+        ("RfpMargin", 120,  40, 240),
+        ("NmpBase",     3,   1,   6),
+        ("NmpDiv",      5,   2,  12),
+        ("LmpBase",     3,   1,   8),
+        ("LmrBase",    75,  20, 150),
+        ("LmrDiv",    225, 120, 400),
+    ];
+
+    pub fn set(name: &str, v: i32) -> bool {
+        let t = |a: &AtomicI32| { a.store(v, Ordering::Relaxed); true };
+        match name.to_ascii_lowercase().as_str() {
+            "rfpmargin" => t(&RFP_MARGIN),
+            "nmpbase"   => t(&NMP_BASE),
+            "nmpdiv"    => t(&NMP_DIV),
+            "lmpbase"   => t(&LMP_BASE),
+            "lmrbase"   => t(&LMR_BASE),
+            "lmrdiv"    => t(&LMR_DIV),
+            _ => false,
+        }
+    }
+}
 
 fn opp(c: Color) -> Color {
     match c {
@@ -156,18 +235,48 @@ pub fn see(board: &Board, mv: Move) -> i32 {
     gain[0]
 }
 
+fn build_lmr_table() -> [[i8; 64]; 64] {
+    let base = tune::lmr_base() as f64 / 100.0;
+    let div = tune::lmr_div() as f64 / 100.0;
+    let mut t = [[0i8; 64]; 64];
+    for (d, row) in t.iter_mut().enumerate().skip(1) {
+        for (m, r) in row.iter_mut().enumerate().skip(1) {
+            *r = (base + (d as f64).ln() * (m as f64).ln() / div) as i8;
+        }
+    }
+    t
+}
+
+#[cfg(not(feature = "tune"))]
 fn lmr_table() -> &'static [[i8; 64]; 64] {
     use std::sync::OnceLock;
     static LMR: OnceLock<[[i8; 64]; 64]> = OnceLock::new();
-    LMR.get_or_init(|| {
-        let mut t = [[0i8; 64]; 64];
-        for (d, row) in t.iter_mut().enumerate().skip(1) {
-            for (m, r) in row.iter_mut().enumerate().skip(1) {
-                *r = (0.75 + (d as f64).ln() * (m as f64).ln() / 2.25) as i8;
-            }
+    LMR.get_or_init(build_lmr_table)
+}
+
+// Under `tune` the table depends on atomics the driver changes between games, so it cannot be
+// cached for the life of the process. Rebuilt per search from `think()`, not per node.
+#[cfg(feature = "tune")]
+fn lmr_table() -> &'static [[i8; 64]; 64] {
+    use std::sync::OnceLock;
+    use std::sync::Mutex;
+    static CUR: OnceLock<Mutex<(i32, i32)>> = OnceLock::new();
+    static TBL: OnceLock<Mutex<Box<[[i8; 64]; 64]>>> = OnceLock::new();
+    let key = (tune::lmr_base(), tune::lmr_div());
+    let cur = CUR.get_or_init(|| Mutex::new((-1, -1)));
+    let tbl = TBL.get_or_init(|| Mutex::new(Box::new(build_lmr_table())));
+    {
+        let mut c = cur.lock().unwrap();
+        if *c != key {
+            *tbl.lock().unwrap() = Box::new(build_lmr_table());
+            *c = key;
         }
-        t
-    })
+    }
+    let guard = tbl.lock().unwrap();
+    // The table is only ever replaced wholesale under the same mutex, and every reader takes
+    // an immutable snapshot, so handing out a 'static reference to the boxed contents is safe
+    // for the duration of a search.
+    unsafe { &*(&**guard as *const [[i8; 64]; 64]) }
 }
 
 #[derive(Clone, Default)]
@@ -202,6 +311,15 @@ pub struct Searcher {
     // correction history: [stm][pawn-structure bucket] -> learned static-eval offset, in
     // 1/CORR_GRAIN pawn units. Heap-allocated: 2*16384 i32 is 128 KB, too big for the stack.
     corr: Vec<i32>,
+    // Per-ply move-ordering scratch. These used to be `Vec::with_capacity(48)` and
+    // `Vec::new()` created fresh at every node -- a malloc/free pair per node at ~1.7M
+    // nodes/s, and `quiets_tried` had no capacity at all so it reallocated as it grew.
+    // Owned by the Searcher and reused: the buffers keep their capacity for the life of
+    // the search. Taken out with mem::take while in use so `self` stays borrowable for
+    // the recursive call, and put back on the paths that matter.
+    move_buf: Vec<Vec<(i32, Move)>>,
+    qmove_buf: Vec<Vec<(i32, Move)>>,
+    quiet_buf: Vec<Vec<Move>>,
     pub nodes: u64,
     seldepth: i32,
     start: Instant,
@@ -235,6 +353,9 @@ impl Searcher {
             counter: [[[0; 64]; 64]; 2],
             cont: vec![0i32; 2 * CONT_PT * CONT_PT],
             corr: vec![0i32; 2 * CORR_SIZE],
+            move_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(64)).collect(),
+            qmove_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(32)).collect(),
+            quiet_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(64)).collect(),
             cont_stack: Vec::with_capacity(MAX_PLY + 4),
             eval_hist: [0; MAX_PLY],
             excluded: [0; MAX_PLY],
@@ -367,14 +488,20 @@ impl Searcher {
         if in_check {
             best = -INF; // must search all evasions; no stand-pat while in check
         } else {
-            best = self.eval_node(board, acc);
+            let raw = self.eval_node(board, acc);
+            best = if CORR_QSEARCH {
+                self.corrected_eval(board, stm, raw)
+            } else {
+                raw
+            };
             if best >= beta {
                 return best;
             }
             alpha = alpha.max(best);
         }
 
-        let mut moves: Vec<(i32, Move)> = Vec::with_capacity(32);
+        let mut moves: Vec<(i32, Move)> = std::mem::take(&mut self.qmove_buf[ply as usize]);
+        moves.clear();
         board.generate_moves(|pm| {
             for mv in pm {
                 let victim = if board.color_on(mv.to) == Some(opp(stm)) {
@@ -403,11 +530,12 @@ impl Searcher {
         });
 
         if in_check && moves.is_empty() {
+            self.qmove_buf[ply as usize] = moves;
             return -MATE + ply;
         }
         moves.sort_unstable_by_key(|&(s, _)| -s);
 
-        for (_, mv) in moves {
+        for &(_, mv) in moves.iter() {
             // delta pruning: even winning this victim can't lift alpha
             if !in_check {
                 if let Some(v) = board.piece_on(mv.to) {
@@ -435,6 +563,7 @@ impl Searcher {
                 }
             }
         }
+        self.qmove_buf[ply as usize] = moves;
         best
     }
 
@@ -545,7 +674,7 @@ impl Searcher {
             && static_eval > self.eval_hist[ply as usize - 2];
 
         // reverse futility pruning
-        if !in_check && ply > 0 && depth <= 6 && static_eval - 120 * depth >= beta {
+        if !in_check && ply > 0 && depth <= 6 && static_eval - tune::rfp_margin() * depth >= beta {
             return static_eval;
         }
 
@@ -557,7 +686,7 @@ impl Searcher {
             && has_non_pawn(board, stm)
         {
             if let Some(nb) = board.null_move() {
-                let r = 3 + depth / 5;
+                let r = tune::nmp_base() + depth / tune::nmp_div();
                 self.path.push(hash);
                 self.cont_stack.push(NULL_CONT);
                 // null move: no pieces change, accumulator carries over unchanged
@@ -591,7 +720,8 @@ impl Searcher {
             (Some(_), Some(a)) => Some(crate::policy::activations(a, stm)),
             _ => None,
         };
-        let mut moves: Vec<(i32, Move)> = Vec::with_capacity(48);
+        let mut moves: Vec<(i32, Move)> = std::mem::take(&mut self.move_buf[ply as usize]);
+        moves.clear();
         board.generate_moves(|pm| {
             for mv in pm {
                 let packed = pack(mv);
@@ -646,6 +776,7 @@ impl Searcher {
         });
 
         if moves.is_empty() {
+            self.move_buf[ply as usize] = moves;
             return if in_check { -MATE + ply } else { 0 };
         }
         moves.sort_unstable_by_key(|&(s, _)| -s);
@@ -654,12 +785,13 @@ impl Searcher {
         let mut best_mv: u16 = 0;
         let mut best_is_capture = false;
         let mut bound = BOUND_UPPER;
-        let mut quiets_tried: Vec<Move> = Vec::new();
+        let mut quiets_tried: Vec<Move> = std::mem::take(&mut self.quiet_buf[ply as usize]);
+        quiets_tried.clear();
 
         // Late-move-pruning schedule: how many quiets are worth searching at this depth before
         // the remainder -- which the ordering has already ranked worst -- are written off.
         // Doubled when improving, since a line that is going our way deserves the longer look.
-        let lmp_limit = ((3 + depth * depth) / if improving { 1 } else { 2 }) as usize;
+        let lmp_limit = ((tune::lmp_base() + depth * depth) / if improving { 1 } else { 2 }) as usize;
 
         for (i, &(_, mv)) in moves.iter().enumerate() {
             let packed_mv = pack(mv);
@@ -811,6 +943,11 @@ impl Searcher {
                 self.update_corr(board, stm, static_eval, best, bound, depth, best_is_capture);
             }
         }
+        // Give the buffers back so the next node at this ply reuses the capacity. The two
+        // `self.stopped` early returns deliberately skip this: the search is ending, and
+        // moving `moves` out is impossible there anyway while it is being iterated.
+        self.move_buf[ply as usize] = moves;
+        self.quiet_buf[ply as usize] = quiets_tried;
         best
     }
 

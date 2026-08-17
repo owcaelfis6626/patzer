@@ -58,6 +58,10 @@ pub fn uci_loop() {
                 println!("option name OwnBook type check default true");
                 println!("option name EvalFile type string default <empty>");
                 println!("option name PolicyFile type string default <empty>");
+                #[cfg(feature = "tune")]
+                for (n, d, lo, hi) in crate::search::tune::PARAMS {
+                    println!("option name {n} type spin default {d} min {lo} max {hi}");
+                }
                 println!("uciok");
             }
             Some("isready") => println!("readyok"),
@@ -104,6 +108,17 @@ pub fn uci_loop() {
                             match crate::policy::load_global(path) {
                                 Ok(()) => println!("info string policy loaded: {path}"),
                                 Err(e) => println!("info string policy load failed: {e}"),
+                            }
+                        }
+                    } else {
+                        // Search-parameter tunables. Only exist under `--features tune`; in a
+                        // release build an unknown option is ignored exactly as before.
+                        #[cfg(feature = "tune")]
+                        if let (Some(n), Some(v)) =
+                            (tokens.get(ni + 1), tokens.get(vi + 1).and_then(|v| v.parse::<i32>().ok()))
+                        {
+                            if crate::search::tune::set(n, v) {
+                                println!("info string tune {n} = {v}");
                             }
                         }
                     }

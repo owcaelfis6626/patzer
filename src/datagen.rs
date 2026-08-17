@@ -518,3 +518,100 @@ fn run_datagen(
         p as f64 / secs
     );
 }
+
+/// Relabel an existing dataset with THIS engine's search score, keeping the positions and the
+/// real game outcome.
+///
+/// WHY. Every external-data arm failed on the LABEL, not the position: raw Lichess evals
+/// -230 Elo, unit-rescaled -217, quota-composed -255. The diagnosis was measured, not guessed
+/// -- Spearman 0.516 against Pearson 0.560, with 15% sign disagreement even at 5-pawn gaps.
+/// Stockfish and patzer disagree on ORDERING, so no rescaling can rescue those labels.
+///
+/// But that finding says nothing against the POSITIONS. Self-play saturated (+150, +29, +19.7)
+/// because the position distribution collapses toward what the current net already handles;
+/// the corpus has millions of positions from real games that self-play will never generate.
+/// This takes the foreign positions and applies native judgement:
+///
+///   position  <- foreign (coverage self-play cannot reach)
+///   cp score  <- OUR search at NODES_PER_MOVE (consistent with what the net must learn)
+///   wdl       <- KEPT from the source (a real game result is ground truth, not an opinion)
+///   best_move <- ours, since it must agree with the score we just wrote
+///
+/// The ceiling is still what our search knows, so this is not free information. It is not
+/// circular either: our search at 5,000 nodes on a position we would never REACH is genuinely
+/// new to the net, and its error there is real and correctable.
+pub fn rescore(in_path: &str, out_path: &str, threads: usize, limit: usize) {
+    let data = std::fs::read(in_path).expect("cannot read dataset");
+    assert!(data.len() % RECORD_SIZE == 0, "bad record size");
+    let total = data.len() / RECORD_SIZE;
+    let n = if limit == 0 { total } else { limit.min(total) };
+    println!("rescore: {n} of {total} records, {threads} threads, {NODES_PER_MOVE} nodes/pos");
+
+    let data = std::sync::Arc::new(data);
+    let out = std::sync::Arc::new(Mutex::new(vec![0u8; n * RECORD_SIZE]));
+    let done = std::sync::Arc::new(AtomicUsize::new(0));
+    let chunk = n.div_ceil(threads.max(1));
+
+    let mut handles = Vec::new();
+    for t in 0..threads.max(1) {
+        let lo = t * chunk;
+        let hi = ((t + 1) * chunk).min(n);
+        if lo >= hi {
+            break;
+        }
+        let (data, out, done) = (data.clone(), out.clone(), done.clone());
+        handles.push(std::thread::spawn(move || {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tt = std::sync::Arc::new(crate::tt::TT::new(16));
+            let mut s = Searcher::for_thread(tt, stop, true);
+            s.silent = true;
+            let mut local = vec![0u8; (hi - lo) * RECORD_SIZE];
+            for i in lo..hi {
+                let rec = &data[i * RECORD_SIZE..(i + 1) * RECORD_SIZE];
+                let pos: [u8; 27] = rec[0..27].try_into().unwrap();
+                let mut r = [0u8; RECORD_SIZE];
+                r.copy_from_slice(rec);
+                if let Ok(board) = Board::from_fen(&unpack_to_fen(&pos), false) {
+                    let mv = s.think(&board, &Limits { nodes: Some(NODES_PER_MOVE), ..Default::default() });
+                    let sc = s.last_score.clamp(-MAX_SCORE_CP, MAX_SCORE_CP) as i16;
+                    r[27..29].copy_from_slice(&sc.to_le_bytes());       // our score
+                    if let Some(m) = mv {
+                        r[30..32].copy_from_slice(&pack(m).to_le_bytes()); // our best move
+                    }
+                    // r[29] (wdl) deliberately untouched -- it is the real game result
+                }
+                local[(i - lo) * RECORD_SIZE..(i - lo + 1) * RECORD_SIZE].copy_from_slice(&r);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % 20_000 == 0 {
+                    println!("  {d}/{n}");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            out.lock().unwrap()[lo * RECORD_SIZE..hi * RECORD_SIZE].copy_from_slice(&local);
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    std::fs::write(out_path, &*out.lock().unwrap()).expect("cannot write");
+    println!("rescore: wrote {n} records -> {out_path}");
+}
+
+/// Per-record NNUE static eval, side-to-move perspective. Companion to `evalbin`, which uses
+/// the PeSTO fallback -- the wrong quantity when the question is what the NET believes.
+pub fn nnueevalbin(in_path: &str, out_path: &str, limit: usize) {
+    let data = std::fs::read(in_path).expect("cannot read dataset");
+    assert!(data.len() % RECORD_SIZE == 0, "bad record size");
+    let total = data.len() / RECORD_SIZE;
+    let n = if limit == 0 { total } else { limit.min(total) };
+    let net = crate::nnue::net().expect("no NNUE loaded -- pass the net path as arg 4");
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let pos: [u8; 27] = data[i * RECORD_SIZE..i * RECORD_SIZE + 27].try_into().unwrap();
+        let board = Board::from_fen(&unpack_to_fen(&pos), false).expect("unpack failed");
+        let e = crate::nnue::eval_scratch(net, &board).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        out.extend_from_slice(&e.to_le_bytes());
+    }
+    std::fs::write(out_path, &out).expect("cannot write evals");
+    println!("nnueevalbin: {n} NNUE static evals -> {out_path}");
+}
