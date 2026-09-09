@@ -32,6 +32,10 @@ fn main() {
         Some("see") => see_gate(),
         Some("book") => book_gate(),
         Some("bench") => bench(),
+        #[cfg(feature = "instrument")]
+        Some("histdump") => histdump(
+            std::env::args().nth(2).and_then(|n| n.parse().ok()).unwrap_or(11),
+        ),
         Some("soak") => soak(),
         Some("genbook") => genbook(
             std::env::args()
@@ -46,6 +50,11 @@ fn main() {
         ),
         Some("nnueinc") => nnueinc(
             &std::env::args().nth(2).expect("usage: nnueinc <net.nnue>"),
+        ),
+        Some("fwdgate") => fwdgate(
+            &std::env::args().nth(2).expect("usage: fwdgate <net.nnue> <data.bin> [limit]"),
+            &std::env::args().nth(3).expect("usage: fwdgate <net.nnue> <data.bin> [limit]"),
+            std::env::args().nth(4).and_then(|n| n.parse().ok()).unwrap_or(2_000_000),
         ),
         Some("nnuegate") => nnuegate(
             &std::env::args().nth(2).expect("usage: nnuegate <data.bin> <net.nnue> <ref.i32>"),
@@ -172,8 +181,17 @@ fn book_gate() {
     println!("GATE book — every repertoire line legality-walked from startpos");
     match book::Book::load() {
         Ok(b) => {
-            // spot checks: startpos offers e2e4 and ONLY e2e4 (KID lines must not
-            // register 1.d4 for White); Locock, Ruy and the KID reply all reachable
+            // Spot checks: startpos offers e2e4 and ONLY e2e4 (the KID lines must not register
+            // 1.d4 for White), and the Ruy and KID replies stay reachable.
+            //
+            // 2026-09-09: THIS GATE HAD BEEN FAILING SINCE 2026-08-10 and nobody noticed,
+            // because a gate that always fails is a gate nobody runs. It asserted the Locock
+            // 5.Ng5 line was reachable; that line was DELIBERATELY removed on 2026-08-10 ("a
+            // club in-joke, not a move worth playing" -- see book.rs) and the assertion was left
+            // behind. The gate was reporting a real absence as a failure, so the checks that
+            // still mattered -- that White never opens 1.d4 out of the KID lines, above all --
+            // were being ignored along with it. Locock is now asserted ABSENT, which is what the
+            // repertoire actually intends.
             let start = Board::startpos();
             let mut seed = 1u64;
             let mut start_moves = std::collections::HashSet::new();
@@ -200,16 +218,16 @@ fn book_gate() {
             let locock = walk(&["e2e4", "e7e5", "g1f3", "d7d6", "d2d4", "g8f6"]);
             let ruy = walk(&["e2e4", "e7e5", "g1f3", "b8c6"]);
             let d4 = walk(&["d2d4"]);
-            let has_locock = can_reach(&locock, "f3g5", &mut seed);
+            let locock_gone = !can_reach(&locock, "f3g5", &mut seed);
             let has_ruy = can_reach(&ruy, "f1b5", &mut seed);
             let has_kid = can_reach(&d4, "g8f6", &mut seed);
             let start_ok = start_moves.len() == 1 && start_moves.contains("e2e4");
             println!(
                 "  {} positions | startpos moves: {:?} (must be exactly e2e4) | \
-                 Locock: {} | Ruy 3.Bb5: {} | KID 1...Nf6: {}",
-                b.positions(), start_moves, has_locock, has_ruy, has_kid
+                 Locock absent: {} | Ruy 3.Bb5: {} | KID 1...Nf6: {}",
+                b.positions(), start_moves, locock_gone, has_ruy, has_kid
             );
-            let ok = start_ok && has_locock && has_ruy && has_kid;
+            let ok = start_ok && locock_gone && has_ruy && has_kid;
             println!("  => {}", if ok { "GATE PASS" } else { "GATE FAIL" });
             if !ok {
                 std::process::exit(1);
@@ -225,6 +243,65 @@ fn book_gate() {
 // ---------------- gate: NNUE int-exactness vs Python reference ----------------
 // Rust quantized forward must equal nnue/ref_forward.py TO THE INTEGER on every record.
 // Any mismatch = stop; a mostly-matching net is a silent-wrongness machine.
+
+/// Print the history-score distribution at LMR sites over the bench suite.
+///
+/// Every threshold in the search that is denominated in history units -- HistLmrDiv, the
+/// history-pruning threshold -- has to be set against THIS, not against the numbers that work
+/// in another engine. See search::instrument.
+#[cfg(feature = "instrument")]
+fn histdump(depth: i32) {
+    println!("HISTDUMP — history scale over the bench suite at depth {depth}");
+    for (_, fen, _) in PERFT_SUITE {
+        let board = Board::from_fen(fen, false).expect("bad FEN");
+        let mut s = Searcher::new(64);
+        s.silent = true;
+        s.think(&board, &Limits { depth: Some(depth), ..Default::default() });
+    }
+    search::instrument::report();
+}
+
+// ---------------- gate 3b: AVX2 forward vs the scalar reference ----------------
+
+/// The AVX2 forward (2026-09-09) claims to return the SAME INTEGER as the scalar reference,
+/// which is what lets it ship without an SPRT on the tree. `nnue::avx2_tests` proves that on
+/// RANDOM nets, which is the harder case for saturation; this proves it on the net and the
+/// positions the engine actually plays with, which is the case that would embarrass us.
+fn fwdgate(net_path: &str, data_path: &str, limit: usize) {
+    println!("GATE fwd — AVX2 forward vs scalar reference, real net, real positions");
+    let net = nnue::load(net_path).expect("cannot load net");
+    let data = std::fs::read(data_path).expect("cannot read dataset");
+    let n = (data.len() / datagen::RECORD_SIZE).min(limit);
+    let mut mismatches = 0usize;
+    let mut first: Option<(usize, i32, i32, String)> = None;
+    for i in 0..n {
+        let pos: [u8; 27] = data[i * datagen::RECORD_SIZE..i * datagen::RECORD_SIZE + 27]
+            .try_into()
+            .unwrap();
+        let fen = datagen::unpack_to_fen(&pos);
+        let board = match Board::from_fen(&fen, false) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let acc = nnue::acc_from(&net, &board);
+        let stm = board.side_to_move();
+        let fast = nnue::forward(&net, &acc.w, &acc.b, stm);
+        let want = nnue::forward_scalar(&net, &acc.w, &acc.b, stm);
+        if fast != want {
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((i, fast, want, fen));
+            }
+        }
+    }
+    println!("  {n} positions | {mismatches} mismatches");
+    if let Some((i, fast, want, fen)) = first {
+        println!("  first at #{i}: avx2 {fast} vs scalar {want}   {fen}");
+        println!("  => GATE FAIL");
+        std::process::exit(1);
+    }
+    println!("  => GATE PASS");
+}
 
 fn nnuegate(data_path: &str, net_path: &str, ref_path: &str) {
     println!("GATE nnue — Rust quantized forward vs Python integer reference, exact match");
@@ -570,8 +647,16 @@ fn mates_gate() {
 // ---------------- gate 3: bench (node-count signature) ----------------
 
 fn bench() {
+    // Depth 11 is the signature depth -- the number every campaign row is quoted against, so
+    // it stays the default. PATZER_BENCH_DEPTH overrides it for MEASUREMENT only (history
+    // magnitudes, table occupancy) where depth 11 is a poor proxy for a 40/15 search; a
+    // signature taken at any other depth is not comparable to the recorded ones.
     const DEPTH: i32 = 11;
-    println!("BENCH — fixed depth {DEPTH}, fresh TT per position; total nodes = functional signature");
+    let depth: i32 = std::env::var("PATZER_BENCH_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEPTH);
+    println!("BENCH — fixed depth {depth}, fresh TT per position; total nodes = functional signature");
     let mut total_nodes = 0u64;
     let t0 = std::time::Instant::now();
     for (name, fen, _) in PERFT_SUITE {
@@ -581,7 +666,7 @@ fn bench() {
         let mv = s.think(
             &board,
             &Limits {
-                depth: Some(DEPTH),
+                depth: Some(depth),
                 ..Default::default()
             },
         );

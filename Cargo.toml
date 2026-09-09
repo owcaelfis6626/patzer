@@ -14,3 +14,6 @@ codegen-units = 1
 # Exposes the search constants as UCI options for SPSA. NOT for release builds:
 # it adds a runtime load per use and rebuilds the LMR table when parameters change.
 tune = []
+# History-scale instrumentation for `patzer histdump`. Zero cost when off, and NOT for release
+# builds: it adds a counter update at every LMR site.
+instrument = []

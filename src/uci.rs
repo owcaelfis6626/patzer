@@ -34,7 +34,13 @@ pub fn uci_loop() {
     // this side's own root scores across the game, for volatility-aware time management
     let mut eval_hist_game: Vec<i32> = Vec::new();
     let book = crate::book::Book::load().expect("book failed legality walk");
-    let mut own_book = true;
+    // DEFAULT FLIPPED TO FALSE, 2026-09-09. Every SPRT this engine has ever run passes
+    // `option.OwnBook=false`, so `true` was the one configuration that had never been measured
+    // -- and it was the one an operator using defaults would get. The match is a CCRL-style
+    // setup where the tester supplies the openings, which is exactly the case where an internal
+    // repertoire is at best redundant and at worst steers into a line the book stops in but the
+    // search has never had to hold. Still available on request; just no longer the default.
+    let mut own_book = false;
     let mut book_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -55,7 +61,7 @@ pub fn uci_loop() {
                 println!("id author Hubert Lipski");
                 println!("option name Hash type spin default 64 min 1 max 4096");
                 println!("option name Threads type spin default 1 min 1 max 256");
-                println!("option name OwnBook type check default true");
+                println!("option name OwnBook type check default false");
                 println!("option name EvalFile type string default <empty>");
                 println!("option name PolicyFile type string default <empty>");
                 #[cfg(feature = "tune")]
@@ -177,7 +183,7 @@ pub fn uci_loop() {
                 let mut limits = Limits::default();
                 let mut it = tokens[1..].iter();
                 while let Some(&tok) = it.next() {
-                    let mut num =
+                    let num =
                         |it: &mut std::slice::Iter<&str>| it.next().and_then(|v| v.parse().ok());
                     match tok {
                         "depth" => limits.depth = num(&mut it).map(|v: i64| v as i32),
@@ -186,6 +192,7 @@ pub fn uci_loop() {
                         "wtime" => limits.wtime = num(&mut it).map(|v: i64| v.max(1) as u128),
                         "btime" => limits.btime = num(&mut it).map(|v: i64| v.max(1) as u128),
                         "winc" => limits.winc = num(&mut it).map(|v: i64| v.max(0) as u128),
+                        "movestogo" => limits.movestogo = num(&mut it).map(|v: i64| v.max(1) as u32),
                         "binc" => limits.binc = num(&mut it).map(|v: i64| v.max(0) as u128),
                         "infinite" => limits.infinite = true,
                         _ => {}

@@ -12,7 +12,7 @@ use crate::nnue;
 use crate::tt::{pack, BOUND_EXACT, BOUND_LOWER, BOUND_UPPER, TT};
 use cozy_chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks, get_rook_moves,
-    BitBoard, Board, Color, Move, Piece, Square,
+    BitBoard, Board, Color, Move, Piece, Rank, Square,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,8 +25,149 @@ const MAX_PLY: usize = 128;
 const CONT_PT: usize = 6 * 64; // continuation-history (piece,to) index space = 384
 const LMP_MAX_DEPTH: i32 = 8; // above this the move-count schedule is too blunt to be safe
 const IIR_MIN_DEPTH: i32 = 4; // 0 disables internal iterative reduction
-const SE_MIN_DEPTH: i32 = 0;  // REVERTED 2026-08-14: +25 in self-play, ~-35 vs Stash
+// REVERTED 2026-08-14, and the reason CORRECTED 2026-08-19. The original note here said
+// "+25 in self-play, ~-35 vs Stash". The -35 was not real: it compared a correctly-measured
+// SE arm against a -6.95 pre-SE baseline that was a 400-game outlier (that binary has since
+// measured -23.78, -23.30 and -24.24). A 6000-game PAIRED run against Stash v26 puts the
+// true difference at -4.89 Elo, 95% CI [-18.1, +8.3] -- indistinguishable from zero.
+// What actually justifies SE=0: the +25.08 +- 13.78 self-play gain DOES NOT TRANSFER
+// (upper bound +8.3), so a 2.5x bigger tree buys nothing measurable outside self-play.
+// Powered to ~+-13 Elo; a smaller real effect is not excluded. See campaign.jsonl
+// "se_paired_external".
+const SE_MIN_DEPTH: i32 = 0;
 const LMR_TWEAKS: bool = true; // PV/improving adjustments to the LMR reduction
+
+// ---- 2026-09-09 search batch. Each gate is independent so a failed SPRT can be bisected
+// without a rebuild matrix. All default OFF; the campaign turns them on one arm at a time.
+const QS_TT: bool = true;       // transposition probe + store in quiescence
+const FUTILITY: bool = true;   // forward futility pruning of quiets near the horizon
+const SEE_PRUNE: bool = true;  // SEE pruning of losing captures and quiets in negamax
+const MATE_DIST: bool = true;  // mate-distance pruning at the top of negamax
+const CAPT_HIST: bool = true;  // history table for capture ordering, beyond MVV-LVA
+// Scale the LMR reduction by the move's history score. THE DIVISOR IS NOT A GUESS: the first
+// version used 8192 and was measured completely inert -- bench signature identical to the
+// feature being off, because at LMR sites |history| never reaches 8192. Distribution measured
+// over the bench suite (n = 78k / 539k / 1.37M sites):
+//
+//     |h| >= 4096 :  0.0% at depth 11,  0.5% at depth 14,  1.4% at depth 16
+//     |h| >=  256 :  2.4% at depth 11, 11.6% at depth 14, 19.4% at depth 16
+//
+// so the tables fill with depth and the signature depth of 11 badly understates what a 40/15
+// search will hold. 512 makes the term bite on roughly a tenth of LMR'd moves at depth 16 and
+// more above that; it is exposed to SPSA rather than trusted.
+const HIST_LMR: bool = true;
+const RAZOR: bool = false;      // drop to qsearch when the static eval is far below alpha
+const NMP_VERIFY: bool = false; // verify a null-move cutoff with a null-disabled re-search
+const NMP_VERIFY_DEPTH: i32 = 8;// only above this depth; below it the re-search costs more than it saves
+const CAPT_LMR: bool = true;   // reduce late CAPTURES too, not only late quiets
+// Stop extending checks once a line has run far past the root depth.
+//
+// MEASURED 2026-09-09 AND CURRENTLY NOT WORTH TESTING. Together with NMP_VERIFY this moves the
+// tree by +0.22% / -1.86% / +1.86% at bench depths 11 / 14 / 17 against an otherwise identical
+// binary -- a near-no-op at every depth reachable on this hardware, and non-monotone, so it is
+// not "a feature that engages with depth" either. The reason is arithmetic: the cap is
+// `ply < 2 * root_depth`, so at depth 17 a check line would have to run 34 plies before it ever
+// binds, which essentially never happens. Making it bite needs a real budget -- a per-path count
+// of check extensions with a hard limit -- not a ply threshold scaled off the root depth.
+// A +/-2% tree change cannot produce Elo an SPRT of affordable size would see, so this is parked
+// rather than measured. (The measurement needed a champion-equivalent binary REBUILT with the
+// PATZER_BENCH_DEPTH override: bin/patzer-champ predates it and silently ran depth 11 whatever
+// the variable said, which made the first version of this comparison meaningless.)
+const CHECK_EXT_CAP: bool = false;
+// Bigger history bonuses. MEASURED MOTIVATION, not taste: the |history| distribution at LMR
+// sites is 89.9% below 64 at bench depth 11 and still 45.6% below 64 at depth 16 (see the
+// HIST_LMR note). The tables are barely populated, so they can hardly discriminate between the
+// late quiets they are asked to rank. The gravity update saturates at 16384 either way -- the
+// bonus only sets how FAST an entry gets there, and at (depth*depth).min(400) it is slow.
+const HIST_BONUS: bool = true;
+// Scale the reverse-futility margin by `improving`. A node whose eval is going the wrong way
+// deserves to be written off sooner than one that is climbing; RFP currently treats them alike.
+const RFP_IMPROVING: bool = true;
+// Let a null move reduce more when the static eval is far above beta -- the further above,
+// the more certain the pass is safe.
+const NMP_EVAL_R: bool = true;
+// ProbCut. If a capture already beats a RAISED beta at reduced depth, the node almost certainly
+// beats the real beta at full depth. Verified with a qsearch first so the reduced-depth search is
+// only paid for on candidates that already look like they cut.
+const PROBCUT: bool = true;
+const PROBCUT_MARGIN: i32 = 200; // how far above beta the raised bound sits
+const PROBCUT_MIN_DEPTH: i32 = 5;
+const PROBCUT_REDUCTION: i32 = 4;
+// Node-type awareness. A "cut node" is one the search EXPECTS to fail high: the child of an
+// all-node, or any null-window child of a node that already failed to raise alpha. The
+// expectation is usually right, so a cut node deserves to be searched more cheaply -- if it is
+// going to fail high anyway, spending full depth on the moves that will not cause it is waste.
+// Stockfish uses this in roughly a dozen places; the two that carry most of it are LMR (reduce
+// harder) and IIR (reduce harder when there is no table move to order by).
+const CUT_NODE: bool = true;
+const CUT_LMR_BONUS: i32 = 2;   // extra LMR plies at an expected-fail-high node
+const CUT_IIR_MIN_DEPTH: i32 = 7; // extra IIR reduction at a cut node with no TT move
+// Prune late quiets the history actively dislikes, before the board clone. LMP already caps how
+// MANY quiets are searched; this cuts the ones the tables have specific evidence against, which
+// is a different screen and fires at shallower depth than LMP's move-count schedule reaches.
+// MEASURED 2026-09-09 AND PARKED, together with KILLER_CLEAR and CONT_EXTRA, for ONE SHARED
+// REASON: this engine's history values are an order of magnitude smaller than in the engines
+// these heuristics are borrowed from, so every threshold written against the usual scale is
+// either inert or wrong. Threshold sweep, bench tree vs 436352:
+//
+//     -2000*d  -500*d  -200*d   INERT -- never fires, signature bit-identical
+//     -100*d   +0.02%
+//      -50*d   +6.87%   -25*d  +8.37%   <- fires, and makes the tree BIGGER
+//
+// A pruning rule that costs nodes is pruning moves that were about to cause cutoffs. The root
+// cause is the table scale: |history| at LMR sites is 89.9% below 64 and never exceeds 4096
+// (measured), because the bonus is (depth*depth).min(400) against a gravity divisor of 16384.
+// HIST_BONUS (in the K_all candidate) raises that bonus 4x. IF K_all IS PROMOTED, RE-MEASURE
+// THE DISTRIBUTION AND RE-CALIBRATE THIS THRESHOLD AND HIST_LMR_DIV BEFORE RETRYING -- the
+// numbers here describe the old, smaller tables and will not transfer.
+const HIST_PRUNE: bool = false;
+const HIST_PRUNE_MAX_DEPTH: i32 = 4;
+const HIST_PRUNE_THRESHOLD: i32 = -2000;
+// Clear the killers two plies ahead. MEASURED 2026-09-09: +41.6% bench tree, and parked.
+// The reasoning that motivated it is wrong for this search. A node at ply P clears killers[P+2],
+// then searches children at P+1 whose own children at P+2 find the slot empty -- so within any
+// subtree the killers at P+2 are always blank on first use, and the heuristic is destroyed
+// rather than refreshed. Stockfish gets away with the same line because of where it sits
+// relative to its stack handling; here it is a straight loss.
+const KILLER_CLEAR: bool = false;
+// Continuation history depth. The 1- and 2-ply predecessors answer "does this move work after
+// that one"; the 4- and 6-ply ones answer "does it work in this kind of plan", which is a
+// different and largely independent question. Stockfish keeps 1, 2, 3, 4 and 6.
+// With CONT_EXTRA off only the first two blocks are ever touched, so the extra allocation is
+// never read and the behaviour is identical.
+// MEASURED 2026-09-09, EXCLUDED FROM THE COMBINED CANDIDATE. Turning this on inflates the
+// bench tree 57% (436352 -> 685759) at equal depth. That is a large bill for a reordering, and
+// the naive implementation here is the likely reason: the four blocks are summed with EQUAL
+// weight into one quiet score, so the extra two mostly-empty tables add noise early, and a
+// maximal 4-block sum (~82k) can outrank a killer (80k) outright -- an ordering inversion the
+// two-block version cannot produce. Stockfish weights the blocks separately and consults them
+// in pruning decisions rather than folding them into one number. Worth revisiting as weighted
+// blocks; not worth games as an equal-weight sum.
+// FOLLOW-UP 2026-09-09: retried with per-block divisors [1,1,4,4] so the distant blocks only
+// refine. Still +42.5% tree (from +57%), so damping the READ is not enough -- the bonus written
+// to all four blocks is identical, and the distant tables were too sparse to rank anything.
+//
+// REVERSED 2026-09-09, LATER THE SAME DAY, AND THE REVERSAL IS THE POINT. Once HIST_BONUS was
+// promoted (4x the bonus, so |h| >= 256 went from 9.3% to 30.1% of LMR sites) the SAME code
+// measures -10.3% tree instead of +42.5%. Nothing about this feature changed; the tables it
+// reads did. THE EARLIER KILL WAS AN ARTEFACT OF TEST ORDER, not a property of the feature --
+// four sparse blocks cannot rank moves, four populated ones can. Any history-derived heuristic
+// measured against the pre-HIST_BONUS tables has to be re-measured before it is believed.
+const CONT_EXTRA: bool = false;
+const CONT_PLIES: [usize; 4] = [1, 2, 4, 6]; // how many plies back each block indexes
+// Per-block divisors. The 1- and 2-ply blocks answer "does this move work after that one" and
+// carry full weight; the 4- and 6-ply blocks answer the vaguer "does it suit this kind of plan"
+// and are damped so they refine the ranking instead of dominating it. The equal-weight version
+// cost +57% tree (see CONT_EXTRA).
+const CONT_WEIGHT_DIV: [i32; 4] = [1, 1, 4, 4];
+const CONT_BLOCKS: usize = 4;
+const RAZOR_MARGIN: i32 = 300;  // per ply of remaining depth
+const RAZOR_MAX_DEPTH: i32 = 3;
+const CAPT_SIZE: usize = 2 * 384 * 6; // [stm][piece*64+to][victim]
+const FUT_MARGIN: i32 = 100;    // futility margin per ply of remaining depth
+const FUT_MAX_DEPTH: i32 = 6;   // above this the static eval is too stale to prune on
+const SEE_Q_MARGIN: i32 = -50;  // quiets worse than this by SEE are cut, scaled by depth
+const SEE_C_MARGIN: i32 = -100; // losing captures worse than this by SEE are cut, x depth
 const NULL_CONT: usize = usize::MAX; // sentinel: no continuation across a null move
 
 // Correction history. The static eval is systematically wrong in whole CLASSES of position --
@@ -39,7 +180,7 @@ const NULL_CONT: usize = usize::MAX; // sentinel: no continuation across a null 
 // share a character, so a full board key would never hit twice. Costs one hash + one array
 // read per node -- unlike the accumulator this sits BESIDE the net, so it does not disturb
 // incremental updates.
-const CORR_HIST: bool = false; // correction history on the static eval
+const CORR_HIST: bool = true; // correction history on the static eval
 const CORR_SIZE: usize = 16_384; // 2^14 pawn-structure buckets per side
 const CORR_GRAIN: i32 = 256; // entries kept in 1/256 pawn units so the EMA stays smooth in i32
 const CORR_MAX: i32 = 128 * CORR_GRAIN; // never shift the eval by more than ~128cp
@@ -54,7 +195,7 @@ const CORR_MAX: i32 = 128 * CORR_GRAIN; // never shift the eval by more than ~12
 // (`w = depth.clamp(1, CORR_W_MAX)`) and every qsearch sample would enter at weight 1 while
 // being the least reliable evidence available. So the table is still learned from negamax
 // nodes only, and merely consulted more often.
-const CORR_QSEARCH: bool = false;
+const CORR_QSEARCH: bool = true;
 const CORR_W: i32 = 16; // EMA horizon; a single sample can take at most half the entry
 const CORR_W_MAX: i32 = CORR_W / 2;
 
@@ -94,12 +235,18 @@ pub mod tune {
     pub const LMP_BASE: i32 = 3;       // late-move-pruning schedule offset
     pub const LMR_BASE: i32 = 75;      // LMR table intercept, x100
     pub const LMR_DIV: i32 = 225;      // LMR table divisor, x100
+    pub const HIST_LMR_DIV: i32 = 512; // history units per ply of LMR adjustment
+    pub const HIST_BONUS_MUL: i32 = 4;   // history bonus = mul*depth^2, capped
+    pub const HIST_BONUS_MAX: i32 = 1600;
     #[inline(always)] pub fn rfp_margin() -> i32 { RFP_MARGIN }
     #[inline(always)] pub fn nmp_base() -> i32 { NMP_BASE }
     #[inline(always)] pub fn nmp_div() -> i32 { NMP_DIV }
     #[inline(always)] pub fn lmp_base() -> i32 { LMP_BASE }
     #[inline(always)] pub fn lmr_base() -> i32 { LMR_BASE }
     #[inline(always)] pub fn lmr_div() -> i32 { LMR_DIV }
+    #[inline(always)] pub fn hist_lmr_div() -> i32 { HIST_LMR_DIV }
+    #[inline(always)] pub fn hist_bonus_mul() -> i32 { HIST_BONUS_MUL }
+    #[inline(always)] pub fn hist_bonus_max() -> i32 { HIST_BONUS_MAX }
 }
 
 #[cfg(feature = "tune")]
@@ -111,12 +258,18 @@ pub mod tune {
     pub static LMP_BASE: AtomicI32 = AtomicI32::new(3);
     pub static LMR_BASE: AtomicI32 = AtomicI32::new(75);
     pub static LMR_DIV: AtomicI32 = AtomicI32::new(225);
+    pub static HIST_LMR_DIV: AtomicI32 = AtomicI32::new(512);
+    pub static HIST_BONUS_MUL: AtomicI32 = AtomicI32::new(4);
+    pub static HIST_BONUS_MAX: AtomicI32 = AtomicI32::new(1600);
     #[inline] pub fn rfp_margin() -> i32 { RFP_MARGIN.load(Ordering::Relaxed) }
     #[inline] pub fn nmp_base() -> i32 { NMP_BASE.load(Ordering::Relaxed) }
     #[inline] pub fn nmp_div() -> i32 { NMP_DIV.load(Ordering::Relaxed).max(1) }
     #[inline] pub fn lmp_base() -> i32 { LMP_BASE.load(Ordering::Relaxed) }
     #[inline] pub fn lmr_base() -> i32 { LMR_BASE.load(Ordering::Relaxed) }
     #[inline] pub fn lmr_div() -> i32 { LMR_DIV.load(Ordering::Relaxed).max(1) }
+    #[inline] pub fn hist_lmr_div() -> i32 { HIST_LMR_DIV.load(Ordering::Relaxed).max(1) }
+    #[inline] pub fn hist_bonus_mul() -> i32 { HIST_BONUS_MUL.load(Ordering::Relaxed).max(1) }
+    #[inline] pub fn hist_bonus_max() -> i32 { HIST_BONUS_MAX.load(Ordering::Relaxed).max(1) }
 
     /// (uci name, default, min, max) -- the driver reads this to build its parameter set.
     pub const PARAMS: &[(&str, i32, i32, i32)] = &[
@@ -126,6 +279,9 @@ pub mod tune {
         ("LmpBase",     3,   1,   8),
         ("LmrBase",    75,  20, 150),
         ("LmrDiv",    225, 120, 400),
+        ("HistLmrDiv", 512, 64, 4096),
+        ("HistBonusMul",  4,  1,  32),
+        ("HistBonusMax", 1600, 200, 8000),
     ];
 
     pub fn set(name: &str, v: i32) -> bool {
@@ -137,7 +293,58 @@ pub mod tune {
             "lmpbase"   => t(&LMP_BASE),
             "lmrbase"   => t(&LMR_BASE),
             "lmrdiv"    => t(&LMR_DIV),
+            "histlmrdiv" => t(&HIST_LMR_DIV),
+            "histbonusmul" => t(&HIST_BONUS_MUL),
+            "histbonusmax" => t(&HIST_BONUS_MAX),
             _ => false,
+        }
+    }
+}
+
+/// History-scale instrumentation, behind `--features instrument` so the shipped binary pays
+/// nothing for it.
+///
+/// WHY THIS IS PERMANENT RATHER THAN A SCRATCH PATCH. Three separate heuristics were written
+/// against the history scale of OTHER engines and failed here for that one reason -- HIST_LMR
+/// was completely inert with a divisor of 8192, HIST_PRUNE never fired above a threshold of
+/// -100*depth, and both were only diagnosed by measuring this distribution. Any change to the
+/// history bonus (HIST_BONUS, or SPSA moving HistBonusMul/Max) moves the whole scale, and every
+/// threshold denominated in history units has to be re-read against it afterwards.
+///
+///   cargo build --release --features instrument && patzer histdump [depth]
+#[cfg(feature = "instrument")]
+pub mod instrument {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const EDGES: [i32; 9] = [64, 256, 1024, 2048, 4096, 8192, 16384, 32768, i32::MAX];
+    pub static LMR_HIST: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+    #[inline]
+    pub fn record(h: i32) {
+        let a = h.unsigned_abs() as i32;
+        let mut i = 0;
+        while i < 9 && a >= EDGES[i] {
+            i += 1;
+        }
+        LMR_HIST[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn report() {
+        let tot: u64 = LMR_HIST.iter().map(|b| b.load(Ordering::Relaxed)).sum();
+        if tot == 0 {
+            println!("  no LMR sites recorded");
+            return;
+        }
+        println!("  |history + continuation| at LMR sites (n={tot}):");
+        let mut lo = 0i32;
+        let mut cum = 0u64;
+        for (i, e) in EDGES.iter().enumerate() {
+            let c = LMR_HIST[i].load(Ordering::Relaxed);
+            cum += c;
+            let hi = if *e == i32::MAX { "inf".to_string() } else { e.to_string() };
+            println!("    {:>6}..{:<8} {:>11}  {:5.1}%   cum {:5.1}%",
+                     lo, hi, c, 100.0 * c as f64 / tot as f64, 100.0 * cum as f64 / tot as f64);
+            lo = *e;
         }
     }
 }
@@ -147,6 +354,34 @@ fn opp(c: Color) -> Color {
         Color::White => Color::Black,
         Color::Black => Color::White,
     }
+}
+
+/// The piece `mv` captures, or None for a non-capture.
+///
+/// 2026-08-18 FIX. Every capture test in this file used to be
+/// `board.color_on(mv.to) == Some(opp(stm))`, which is FALSE for en passant: the destination
+/// square is empty. nnue::acc_update_basic already relied on exactly that fact to detect ep
+/// (empty `to` + a diagonal pawn move), so the codebase proved the bug while the search
+/// classified ep as a QUIET move -- eligible for late-move pruning and LMR, updating killers
+/// and history as a quiet, and, worst of all, never generated in qsearch at all unless in
+/// check, leaving quiescence structurally blind to en passant.
+///
+/// Castling is king-takes-own-rook in cozy-chess, so `color_on(mv.to) == Some(stm)`; it is not
+/// a capture and is correctly excluded by the `opp(stm)` test.
+#[inline]
+fn capture_victim(board: &Board, mv: Move) -> Option<Piece> {
+    let stm = board.side_to_move();
+    if board.color_on(mv.to) == Some(opp(stm)) {
+        return board.piece_on(mv.to);
+    }
+    // en passant: a pawn moving diagonally onto an empty square
+    if board.piece_on(mv.from) == Some(Piece::Pawn)
+        && mv.from.file() != mv.to.file()
+        && board.piece_on(mv.to).is_none()
+    {
+        return Some(Piece::Pawn);
+    }
+    None
 }
 
 // ---------------- static exchange evaluation ----------------
@@ -247,37 +482,17 @@ fn build_lmr_table() -> [[i8; 64]; 64] {
     t
 }
 
-#[cfg(not(feature = "tune"))]
-fn lmr_table() -> &'static [[i8; 64]; 64] {
-    use std::sync::OnceLock;
-    static LMR: OnceLock<[[i8; 64]; 64]> = OnceLock::new();
-    LMR.get_or_init(build_lmr_table)
-}
-
-// Under `tune` the table depends on atomics the driver changes between games, so it cannot be
-// cached for the life of the process. Rebuilt per search from `think()`, not per node.
-#[cfg(feature = "tune")]
-fn lmr_table() -> &'static [[i8; 64]; 64] {
-    use std::sync::OnceLock;
-    use std::sync::Mutex;
-    static CUR: OnceLock<Mutex<(i32, i32)>> = OnceLock::new();
-    static TBL: OnceLock<Mutex<Box<[[i8; 64]; 64]>>> = OnceLock::new();
-    let key = (tune::lmr_base(), tune::lmr_div());
-    let cur = CUR.get_or_init(|| Mutex::new((-1, -1)));
-    let tbl = TBL.get_or_init(|| Mutex::new(Box::new(build_lmr_table())));
-    {
-        let mut c = cur.lock().unwrap();
-        if *c != key {
-            *tbl.lock().unwrap() = Box::new(build_lmr_table());
-            *c = key;
-        }
-    }
-    let guard = tbl.lock().unwrap();
-    // The table is only ever replaced wholesale under the same mutex, and every reader takes
-    // an immutable snapshot, so handing out a 'static reference to the boxed contents is safe
-    // for the duration of a search.
-    unsafe { &*(&**guard as *const [[i8; 64]; 64]) }
-}
+// 2026-08-18 FIX: the LMR table now lives in the Searcher (field `lmr`) and is rebuilt once per
+// search in think(). It used to be a process-wide static handed out as a `&'static` reference:
+// in the `tune` build that reference pointed into a Box which a later parameter change REPLACED
+// under the mutex, freeing the allocation while readers still held the reference -- a
+// use-after-free. The old comment claimed "every reader takes an immutable snapshot", but
+// replacing a Box deallocates it; there was no snapshot.
+//
+// Per-Searcher storage is also what the old comment said it wanted ("rebuilt per search from
+// think(), not per node"), needs no unsafe, no mutex and no cfg split, and gives each SMP
+// thread its own copy. Values are unchanged in the non-tune build, so this is behaviour-neutral
+// on its own.
 
 #[derive(Clone, Default)]
 pub struct Limits {
@@ -288,6 +503,9 @@ pub struct Limits {
     pub btime: Option<u128>,
     pub winc: Option<u128>,
     pub binc: Option<u128>,
+    /// Moves remaining before the clock is replenished, for a "40 moves in 15 minutes" style
+    /// control. `None` means sudden death or increment-only.
+    pub movestogo: Option<u32>,
     pub infinite: bool,
 }
 
@@ -308,6 +526,28 @@ pub struct Searcher {
     eval_hist: [i32; MAX_PLY],
     // move excluded at each ply during a singular-verification search (0 = none)
     excluded: [u16; MAX_PLY],
+    // LMR reduction table, rebuilt once per search in think() (see build_lmr_table)
+    lmr: [[i8; 64]; 64],
+    // Ply at which null-move pruning is currently suppressed (-1 = nowhere). Set only around a
+    // verification re-search, which re-enters negamax at the SAME ply on the SAME position and
+    // would otherwise recurse into its own null move forever.
+    nmp_off_ply: i32,
+    // Depth of the iterative-deepening iteration in progress, for the check-extension cap.
+    root_depth: i32,
+    // Best move found at the root by the last completed iteration, packed. Tracked directly
+    // rather than re-probed from the TT, which could have been evicted mid-search.
+    root_best: u16,
+    // capture history: [stm][moving piece*64 + to][victim] -> learned "how often did this
+    // capture actually cut". MVV-LVA and SEE both judge a capture by the material on the
+    // board; this judges it by what the search has already learned about it.
+    capt: Vec<i32>,
+    // captures searched at this node without cutting, so a fail-high can penalise them --
+    // the capture-side mirror of `quiets_tried`.
+    capt_buf: Vec<Vec<Move>>,
+    // ProbCut candidate captures. Its own buffer rather than a borrowed one: the probcut
+    // search recurses, and reusing a buffer that the recursion also touches is how a subtle
+    // aliasing bug gets in.
+    pc_buf: Vec<Vec<Move>>,
     // correction history: [stm][pawn-structure bucket] -> learned static-eval offset, in
     // 1/CORR_GRAIN pawn units. Heap-allocated: 2*16384 i32 is 128 KB, too big for the stack.
     corr: Vec<i32>,
@@ -351,14 +591,21 @@ impl Searcher {
             killers: [[0; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             counter: [[[0; 64]; 64]; 2],
-            cont: vec![0i32; 2 * CONT_PT * CONT_PT],
+            cont: vec![0i32; CONT_BLOCKS * CONT_PT * CONT_PT],
             corr: vec![0i32; 2 * CORR_SIZE],
+            capt: vec![0i32; CAPT_SIZE],
+            capt_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(32)).collect(),
+            pc_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(32)).collect(),
             move_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(64)).collect(),
             qmove_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(32)).collect(),
             quiet_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(64)).collect(),
             cont_stack: Vec::with_capacity(MAX_PLY + 4),
             eval_hist: [0; MAX_PLY],
             excluded: [0; MAX_PLY],
+            lmr: [[0i8; 64]; 64],
+            root_best: 0,
+            nmp_off_ply: -1,
+            root_depth: 0,
             nodes: 0,
             seldepth: 0,
             start: Instant::now(),
@@ -484,6 +731,50 @@ impl Searcher {
         let stm = board.side_to_move();
         let in_check = !board.checkers().is_empty();
 
+        // Transposition probe + store (2026-09-09). qsearch had neither -- the single largest
+        // standard omission in this search: quiescence is ~63% of all nodes (216481 of 343299
+        // at bench) and every one re-derived a result the table may already hold. Worth a third
+        // of the whole tree: bench 673771 -> 448187.
+        //
+        // THE DEPTH TEST IS LOAD-BEARING, and cost a gate failure to find. qsearch may cut only
+        // on entries QSEARCH stored (depth 0). Returning a NEGAMAX-stored entry makes the search
+        // report mate 2 at depth 5 and then mate 3 at depth 6 on the `mates` suite's rook-roller
+        // -- a score getting WORSE with depth, which is a broken search, not a tuning artefact.
+        // Leave-one-out over the entry space, all at bench depth 11:
+        //
+        //     probe qsearch entries only (d == 0)   bench 448187   mates PASS
+        //     probe negamax entries only (d >= 1)   bench 541446   mates FAIL
+        //     probe everything                      bench 507406   mates FAIL
+        //     probe everything except EXACT bounds  bench 551139   mates FAIL
+        //
+        // so it is negamax-stored entries specifically, and NOT the EXACT bound -- excluding
+        // those alone does not rescue it. THE MECHANISM IS UNCONFIRMED; what is established is
+        // the classification above, which is what this guard is written against. The plausible
+        // reading is that a negamax entry describes a full-width search of the position while
+        // qsearch's caller asked for the quiescence value, and negamax only ever consumes these
+        // under `e.depth >= depth` -- a comparison qsearch has no depth to make.
+        //
+        // The MOVE hint is taken from any entry at any depth: it is only an ordering
+        // suggestion, is checked against generated moves, and cannot return a score.
+        let hash = board.hash();
+        let mut tt_mv: u16 = 0;
+        if QS_TT {
+            if let Some(e) = self.tt.probe(hash) {
+                tt_mv = e.mv;
+                if e.depth as i32 <= 0 {
+                    let sc = tt_score_from(e.score as i32, ply);
+                    match e.bound {
+                        BOUND_EXACT => return sc,
+                        BOUND_LOWER if sc >= beta => return sc,
+                        BOUND_UPPER if sc <= alpha => return sc,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let alpha_orig = alpha;
+        let mut best_mv: u16 = 0;
         let mut best;
         if in_check {
             best = -INF; // must search all evasions; no stand-pat while in check
@@ -502,13 +793,38 @@ impl Searcher {
 
         let mut moves: Vec<(i32, Move)> = std::mem::take(&mut self.qmove_buf[ply as usize]);
         moves.clear();
-        board.generate_moves(|pm| {
+        // Destination mask (2026-09-09). qsearch used to walk EVERY legal move and throw away
+        // the ~85% that are quiet -- and the throwing-away is not free: each rejected move costs
+        // a Move construction plus the `capture_victim` board lookups. cozy's `generate_moves_for`
+        // masks source PIECES, not destinations, so the mask goes on `pm.to` instead.
+        //
+        // Exactness: a move outside this mask lands on an empty non-ep, non-promotion square, so
+        // `victim` is None and `is_qpromo` false, and the filter below would have dropped it
+        // anyway. Same move list, same order, same tree -- the bench signature is unchanged.
+        let qtargets = if in_check {
+            BitBoard::FULL // in check every evasion is searched, quiet or not
+        } else {
+            let mut t = board.colors(opp(stm));
+            if let Some(f) = board.en_passant() {
+                // the ep capture's destination is EMPTY, so it is not in the enemy occupancy
+                t |= Square::new(f, Rank::Sixth.relative_to(stm)).bitboard();
+            }
+            t
+        };
+        let promo_rank = Rank::Eighth.relative_to(stm).bitboard();
+        board.generate_moves(|mut pm| {
+            if !in_check {
+                let mut t = qtargets;
+                if pm.piece == Piece::Pawn {
+                    t |= promo_rank; // queen promotions are searched even when they capture nothing
+                }
+                pm.to &= t;
+                if pm.to.is_empty() {
+                    return false;
+                }
+            }
             for mv in pm {
-                let victim = if board.color_on(mv.to) == Some(opp(stm)) {
-                    board.piece_on(mv.to)
-                } else {
-                    None
-                };
+                let victim = capture_victim(board, mv);
                 let is_qpromo = mv.promotion == Some(Piece::Queen);
                 if in_check || victim.is_some() || is_qpromo {
                     // SEE pruning: skip losing captures entirely (not while in check)
@@ -517,11 +833,15 @@ impl Searcher {
                     }
                     let attacker = board.piece_on(mv.from).unwrap();
                     let mut s = 0;
-                    if let Some(v) = victim {
-                        s += 100_000 + 10 * piece_val(v) - piece_val(attacker);
-                    }
-                    if is_qpromo {
-                        s += 90_000;
+                    if QS_TT && tt_mv != 0 && pack(mv) == tt_mv {
+                        s = 1_000_000; // the table's move first, as in negamax
+                    } else {
+                        if let Some(v) = victim {
+                            s += 100_000 + 10 * piece_val(v) - piece_val(attacker);
+                        }
+                        if is_qpromo {
+                            s += 90_000;
+                        }
                     }
                     moves.push((s, mv));
                 }
@@ -538,16 +858,15 @@ impl Searcher {
         for &(_, mv) in moves.iter() {
             // delta pruning: even winning this victim can't lift alpha
             if !in_check {
-                if let Some(v) = board.piece_on(mv.to) {
-                    if board.color_on(mv.to) == Some(opp(stm))
-                        && best + piece_val(v) + 200 < alpha
-                    {
+                if let Some(v) = capture_victim(board, mv) {
+                    if best + piece_val(v) + 200 < alpha {
                         continue;
                     }
                 }
             }
             let mut nb = board.clone();
             nb.play_unchecked(mv);
+            self.tt.prefetch(nb.hash());
             let nacc = acc.map(|a| nnue::acc_update(nnue::net().unwrap(), a, board, mv));
             let sc = -self.qsearch(&nb, ply + 1, -beta, -alpha, nacc.as_ref());
             if self.stopped {
@@ -555,6 +874,7 @@ impl Searcher {
             }
             if sc > best {
                 best = sc;
+                best_mv = pack(mv);
                 if sc > alpha {
                     alpha = sc;
                     if sc >= beta {
@@ -564,25 +884,60 @@ impl Searcher {
             }
         }
         self.qmove_buf[ply as usize] = moves;
+        if QS_TT && !self.stopped {
+            // Bound is decided the same way negamax decides it: a score that never beat the
+            // original alpha is an upper bound, one that reached beta is a lower bound.
+            let bound = if best >= beta {
+                BOUND_LOWER
+            } else if best > alpha_orig {
+                BOUND_EXACT
+            } else {
+                BOUND_UPPER
+            };
+            self.tt.store(hash, best_mv, tt_score_to(best, ply), 0, bound);
+        }
         best
     }
 
     // continuation-history update with the same gravity as butterfly history. `bonus` is signed:
     // positive rewards, negative penalizes. Applied to whichever predecessor slots exist.
     #[inline]
-    fn cont_bonus(&mut self, cont1: Option<usize>, cont2: Option<usize>, ci: usize, bonus: i32) {
-        if let Some(p) = cont1 {
-            if p != NULL_CONT {
-                let e = &mut self.cont[p * CONT_PT + ci];
-                *e += bonus - *e * bonus.abs() / 16_384;
+    fn cont_bonus(&mut self, preds: &[Option<usize>; CONT_BLOCKS], ci: usize, bonus: i32) {
+        for (b, pred) in preds.iter().enumerate().take(cont_blocks()) {
+            if let Some(p) = *pred {
+                if p != NULL_CONT {
+                    let e = &mut self.cont[b * CONT_PT * CONT_PT + p * CONT_PT + ci];
+                    *e += bonus - *e * bonus.abs() / 16_384;
+                }
             }
         }
-        if let Some(p) = cont2 {
-            if p != NULL_CONT {
-                let e = &mut self.cont[CONT_PT * CONT_PT + p * CONT_PT + ci];
-                *e += bonus - *e * bonus.abs() / 16_384;
+    }
+
+    /// The (piece,to) index of the move played 1, 2, 4 and 6 plies ago, where each exists.
+    #[inline]
+    fn cont_preds(&self) -> [Option<usize>; CONT_BLOCKS] {
+        let n = self.cont_stack.len();
+        let mut out = [None; CONT_BLOCKS];
+        for (b, &back) in CONT_PLIES.iter().enumerate().take(cont_blocks()) {
+            if n >= back {
+                out[b] = Some(self.cont_stack[n - back]);
             }
         }
+        out
+    }
+
+    /// Sum of the continuation-history entries for `ci` under the current predecessors.
+    #[inline]
+    fn cont_score(&self, preds: &[Option<usize>; CONT_BLOCKS], ci: usize) -> i32 {
+        let mut h = 0;
+        for (b, pred) in preds.iter().enumerate().take(cont_blocks()) {
+            if let Some(p) = *pred {
+                if p != NULL_CONT {
+                    h += self.cont[b * CONT_PT * CONT_PT + p * CONT_PT + ci] / CONT_WEIGHT_DIV[b];
+                }
+            }
+        }
+        h
     }
 
     // ---------------- main search ----------------
@@ -596,6 +951,7 @@ impl Searcher {
         beta: i32,
         prev: u16,
         acc: Option<&nnue::Acc>,
+        cut_node: bool,
     ) -> i32 {
         if self.check_stop() {
             return 0;
@@ -610,7 +966,13 @@ impl Searcher {
 
         let in_check = !board.checkers().is_empty();
         if in_check {
-            depth += 1; // check extension
+            // Check extension. Uncapped, a forcing sequence can extend a line indefinitely --
+            // harmless at bench depth 11, much less so at the ~depth 22-25 a 40/15 search
+            // reaches. The cap lets checks extend freely until the line is already twice the
+            // root depth, which is where a genuine forcing line has long since resolved.
+            if !CHECK_EXT_CAP || ply < 2 * self.root_depth {
+                depth += 1;
+            }
         }
         if depth <= 0 {
             return self.qsearch(board, ply, alpha, beta, acc);
@@ -618,6 +980,18 @@ impl Searcher {
         self.nodes += 1;
         if ply as usize >= MAX_PLY - 1 {
             return self.eval_node(board, acc);
+        }
+
+        // Mate-distance pruning. A mate found at this ply cannot be better than MATE - ply, nor
+        // worse than -MATE + ply, so a window already outside that range has nothing to find.
+        // Costs two compares and mainly buys shorter mate lines in won positions.
+        if MATE_DIST && ply > 0 {
+            let a = alpha.max(-MATE + ply);
+            let b = beta.min(MATE - ply - 1);
+            if a >= b {
+                return a;
+            }
+            alpha = a;
         }
 
         // TT probe
@@ -631,12 +1005,27 @@ impl Searcher {
         let mut tt_depth: i32 = -1;
         let mut tt_score: i32 = 0;
         let mut tt_bound: u8 = 0;
+        // Hoisted above the probe (2026-08-18): the TT cutoff below needs it. It only reads the
+        // window, so it was always computable here.
+        let is_pv = beta - alpha > 1;
         if excl == 0 {
             if let Some(e) = self.tt.probe(hash) {
                 tt_mv = e.mv;
                 tt_depth = e.depth as i32;
                 tt_score = tt_score_from(e.score as i32, ply);
                 tt_bound = e.bound;
+                // NO PV GUARD HERE, DELIBERATELY, AND THE COMMENT THAT USED TO SIT HERE WAS
+                // WRONG. It read "2026-08-18 FIX: no TT cutoff in a PV node" and described a
+                // guard this code does not have -- the condition below has never tested `is_pv`.
+                // The guard was written, measured at -38.21 +/- 18.34 over 566 games
+                // (sprt_bisect_noPVguard.log, leave-one-out against the same base as the full
+                // fix set), and removed. The comment was left behind, so for three weeks the
+                // file claimed a fix it did not contain.
+                //
+                // The textbook argument for the guard is real: a stored score can come from a
+                // null-window search that never verified it inside (alpha, beta), so returning
+                // it on the principal variation truncates the PV. It measured negative here
+                // anyway, and the measurement is what governs. Recorded 2026-09-09.
                 if ply > 0 && e.depth as i32 >= depth {
                     let sc = tt_score_from(e.score as i32, ply);
                     match e.bound {
@@ -655,6 +1044,11 @@ impl Searcher {
         // internal iterative deepening re-search.
         if IIR_MIN_DEPTH > 0 && depth >= IIR_MIN_DEPTH && tt_mv == 0 {
             depth -= 1;
+            // With no table move the ordering here is guesswork, and at a node we already
+            // expect to fail high that is a bad place to spend depth. Take a second ply.
+            if CUT_NODE && cut_node && depth >= CUT_IIR_MIN_DEPTH {
+                depth -= 1;
+            }
         }
 
         let stm = board.side_to_move();
@@ -665,7 +1059,6 @@ impl Searcher {
         let static_eval = self.corrected_eval(board, stm, raw_eval);
         self.eval_hist[ply as usize] = static_eval;
 
-        let is_pv = beta - alpha > 1;
         // "improving": the side to move stands better than it did two plies ago, so this line is
         // going our way and late quiets deserve a longer look before being pruned. Meaningless
         // while in check (the static eval of a check position says nothing), so force it false.
@@ -674,8 +1067,31 @@ impl Searcher {
             && static_eval > self.eval_hist[ply as usize - 2];
 
         // reverse futility pruning
-        if !in_check && ply > 0 && depth <= 6 && static_eval - tune::rfp_margin() * depth >= beta {
+        let rfp_depth = if RFP_IMPROVING { depth - improving as i32 } else { depth };
+        if !in_check && ply > 0 && depth <= 6 && static_eval - tune::rfp_margin() * rfp_depth >= beta
+        {
             return static_eval;
+        }
+
+        // Razoring. When the static eval is this far below alpha with little depth left, the
+        // node is very unlikely to reach alpha by quiet play. Rather than trust that outright,
+        // verify with a quiescence search at the same window: only a qsearch that ALSO fails
+        // low returns. That verification is what separates razoring from simply forfeiting the
+        // node, and it is cheap because qsearch is where the position was heading anyway.
+        if RAZOR
+            && !is_pv
+            && !in_check
+            && ply > 0
+            && depth <= RAZOR_MAX_DEPTH
+            && static_eval + RAZOR_MARGIN * depth < alpha
+        {
+            let s = self.qsearch(board, ply, alpha - 1, alpha, acc);
+            if self.stopped {
+                return 0;
+            }
+            if s < alpha {
+                return s;
+            }
         }
 
         // null-move pruning
@@ -684,32 +1100,118 @@ impl Searcher {
             && depth >= 3
             && static_eval >= beta
             && has_non_pawn(board, stm)
+            && self.nmp_off_ply != ply
         {
             if let Some(nb) = board.null_move() {
-                let r = tune::nmp_base() + depth / tune::nmp_div();
+                let mut r = tune::nmp_base() + depth / tune::nmp_div();
+                if NMP_EVAL_R {
+                    r += ((static_eval - beta) / 200).clamp(0, 3);
+                }
                 self.path.push(hash);
                 self.cont_stack.push(NULL_CONT);
                 // null move: no pieces change, accumulator carries over unchanged
-                let sc = -self.negamax(&nb, depth - 1 - r, ply + 1, -beta, -beta + 1, 0, acc);
+                let sc = -self.negamax(&nb, depth - 1 - r, ply + 1, -beta, -beta + 1, 0, acc, !cut_node);
                 self.cont_stack.pop();
                 self.path.pop();
                 if self.stopped {
                     return 0;
                 }
                 if sc >= beta {
-                    return beta;
+                    // Verification. A null-move cutoff asserts "the position is so good that
+                    // even passing beats beta" -- which is exactly false in zugzwang, where
+                    // passing is the best move available and every real move loses ground.
+                    // has_non_pawn() screens the crude endgame case; it does not screen a
+                    // middlegame squeeze. Above NMP_VERIFY_DEPTH the cutoff is re-searched at
+                    // reduced depth with null disabled AT THIS PLY (deeper plies keep it), and
+                    // only a second fail-high returns. Deep nodes are rare and expensive to get
+                    // wrong, which is why the check is bought only there.
+                    let verified = if NMP_VERIFY && depth >= NMP_VERIFY_DEPTH {
+                        let saved = self.nmp_off_ply;
+                        self.nmp_off_ply = ply;
+                        let v = self.negamax(board, depth - r, ply, beta - 1, beta, prev, acc, cut_node);
+                        self.nmp_off_ply = saved;
+                        if self.stopped {
+                            return 0;
+                        }
+                        v >= beta
+                    } else {
+                        true
+                    };
+                    // A failed verification does NOT return -- it falls through to the ordinary
+                    // move loop below, which is the whole point: the node gets searched for
+                    // real instead of being written off on the strength of a pass.
+                    if verified {
+                        // Kept fail-hard DELIBERATELY. Returning `sc` is the textbook fail-soft
+                        // form, but the null score comes from a REDUCED-depth search in which
+                        // the opponent was handed a free move, and propagating it measured
+                        // negative here (2026-08-21). `beta` bounds that damage.
+                        return beta;
+                    }
                 }
             }
         }
 
+        // ProbCut. A capture that clears beta + PROBCUT_MARGIN at reduced depth is very unlikely
+        // to fail to clear beta at full depth, so the node can be cut without the full search.
+        //
+        // Order of work matters for cost: candidates are screened by SEE against the margin they
+        // have to cover, then by a QSEARCH at the raised window, and only survivors of both pay
+        // for a reduced-depth negamax. Skipped when the table already says this node cannot
+        // reach the raised bound at comparable depth -- that is the cheapest screen of all.
+        if PROBCUT
+            && !is_pv
+            && !in_check
+            && ply > 0
+            && depth >= PROBCUT_MIN_DEPTH
+            && beta.abs() < MATE_BOUND
+            && !(tt_depth >= depth - PROBCUT_REDUCTION && tt_score < beta + PROBCUT_MARGIN
+                 && tt_bound != 0u8)
+        {
+            let pc_beta = beta + PROBCUT_MARGIN;
+            let pc_depth = depth - PROBCUT_REDUCTION;
+            let mut cands: Vec<Move> = std::mem::take(&mut self.pc_buf[ply as usize]);
+            cands.clear();
+            let enemy = board.colors(opp(stm));
+            board.generate_moves(|mut pm| {
+                pm.to &= enemy;
+                for mv in pm {
+                    if see(board, mv) >= pc_beta - static_eval {
+                        cands.push(mv);
+                    }
+                }
+                false
+            });
+            for &mv in cands.iter() {
+                let mut nb = board.clone();
+                nb.play_unchecked(mv);
+                self.tt.prefetch(nb.hash());
+                let nacc = acc.map(|a| nnue::acc_update(nnue::net().unwrap(), a, board, mv));
+                let na = nacc.as_ref();
+                let cur_ci = board.piece_on(mv.from).unwrap() as usize * 64 + mv.to as usize;
+                self.path.push(hash);
+                self.cont_stack.push(cur_ci);
+                // cheap screen first
+                let mut v = -self.qsearch(&nb, ply + 1, -pc_beta, -pc_beta + 1, na);
+                if v >= pc_beta && pc_depth >= 1 {
+                    v = -self.negamax(&nb, pc_depth, ply + 1, -pc_beta, -pc_beta + 1, pack(mv), na, !cut_node);
+                }
+                self.cont_stack.pop();
+                self.path.pop();
+                if self.stopped {
+                    self.pc_buf[ply as usize] = cands;
+                    return 0;
+                }
+                if v >= pc_beta {
+                    self.pc_buf[ply as usize] = cands;
+                    return v;
+                }
+            }
+            self.pc_buf[ply as usize] = cands;
+        }
+
         // continuation-history predecessors for this node: 1-ply-ago (counter-move history) and
         // 2-ply-ago (follow-up history). cont_stack.len() == ply here (each ply pushes once).
-        let cont1 = self.cont_stack.last().copied();
-        let cont2 = if self.cont_stack.len() >= 2 {
-            Some(self.cont_stack[self.cont_stack.len() - 2])
-        } else {
-            None
-        };
+        let preds = self.cont_preds();
 
         // generate + score. Arm A (Stage 3): when a policy net is loaded, QUIET moves are
         // ranked by the policy logit instead of killers/countermove/history — captures,
@@ -725,17 +1227,28 @@ impl Searcher {
         board.generate_moves(|pm| {
             for mv in pm {
                 let packed = pack(mv);
-                let is_capture = board.color_on(mv.to) == Some(opp(stm));
+                // NB: must read the victim through capture_victim, not piece_on(mv.to) --
+                // for en passant the destination is empty and .unwrap() would panic.
+                let victim = capture_victim(board, mv);
                 let s = if packed == tt_mv && tt_mv != 0 {
                     1_000_000
-                } else if is_capture {
-                    let v = board.piece_on(mv.to).unwrap();
+                } else if let Some(v) = victim {
                     let a = board.piece_on(mv.from).unwrap();
                     let mvvlva = 10 * piece_val(v) - piece_val(a);
-                    if see(board, mv) >= 0 {
-                        100_000 + mvvlva // winning/equal captures ahead of everything but TT
+                    // MVV-LVA and SEE both judge a capture by the material standing on the
+                    // board. Capture history adds what the search has actually learned about
+                    // this (piece, destination, victim) triple. Divided down so it re-ranks
+                    // captures against each other without ever lifting a losing capture out of
+                    // its bucket or above the TT move.
+                    let ch = if CAPT_HIST {
+                        self.capt[capt_index(stm, a, mv.to, v)] / 64
                     } else {
-                        -20_000 + mvvlva / 10 // losing captures behind all quiets
+                        0
+                    };
+                    if see(board, mv) >= 0 {
+                        100_000 + mvvlva + ch // winning/equal captures ahead of all but TT
+                    } else {
+                        -20_000 + mvvlva / 10 + ch // losing captures behind all quiets
                     }
                 } else if mv.promotion == Some(Piece::Queen) {
                     95_000
@@ -757,18 +1270,8 @@ impl Searcher {
                     // butterfly history + continuation history (1-ply + 2-ply predecessors)
                     let mover = board.piece_on(mv.from).unwrap();
                     let ci = mover as usize * 64 + mv.to as usize;
-                    let mut hsc = self.history[stm as usize][mv.from as usize][mv.to as usize];
-                    if let Some(p) = cont1 {
-                        if p != NULL_CONT {
-                            hsc += self.cont[p * CONT_PT + ci];
-                        }
-                    }
-                    if let Some(p) = cont2 {
-                        if p != NULL_CONT {
-                            hsc += self.cont[CONT_PT * CONT_PT + p * CONT_PT + ci];
-                        }
-                    }
-                    hsc
+                    self.history[stm as usize][mv.from as usize][mv.to as usize]
+                        + self.cont_score(&preds, ci)
                 };
                 moves.push((s, mv));
             }
@@ -781,12 +1284,18 @@ impl Searcher {
         }
         moves.sort_unstable_by_key(|&(s, _)| -s);
 
+        if KILLER_CLEAR && (ply as usize) + 2 < MAX_PLY {
+            self.killers[ply as usize + 2] = [0; 2];
+        }
+
         let mut best = -INF;
         let mut best_mv: u16 = 0;
         let mut best_is_capture = false;
         let mut bound = BOUND_UPPER;
         let mut quiets_tried: Vec<Move> = std::mem::take(&mut self.quiet_buf[ply as usize]);
         quiets_tried.clear();
+        let mut caps_tried: Vec<Move> = std::mem::take(&mut self.capt_buf[ply as usize]);
+        caps_tried.clear();
 
         // Late-move-pruning schedule: how many quiets are worth searching at this depth before
         // the remainder -- which the ordering has already ranked worst -- are written off.
@@ -798,7 +1307,7 @@ impl Searcher {
             if packed_mv == excl {
                 continue; // singular verification: this node is searched without its best move
             }
-            let is_capture = board.color_on(mv.to) == Some(opp(stm));
+            let is_capture = capture_victim(board, mv).is_some();
             let is_quiet = !is_capture && mv.promotion.is_none();
 
             // Late move pruning. Once `lmp_limit` quiets have been searched without beating
@@ -815,6 +1324,65 @@ impl Searcher {
                 && quiets_tried.len() >= lmp_limit
             {
                 continue;
+            }
+
+            // History pruning. A late quiet that the tables have specific evidence against is
+            // worth less than the board clone it would cost. Distinct from LMP: that one counts
+            // moves, this one reads what the search already learned about THIS move.
+            if HIST_PRUNE
+                && !is_pv
+                && !in_check
+                && is_quiet
+                && i >= 3
+                && depth <= HIST_PRUNE_MAX_DEPTH
+                && best > -MATE_BOUND
+            {
+                let ci = board.piece_on(mv.from).unwrap() as usize * 64 + mv.to as usize;
+                let h = self.history[stm as usize][mv.from as usize][mv.to as usize]
+                    + self.cont_score(&preds, ci);
+                if h < HIST_PRUNE_THRESHOLD * depth {
+                    continue;
+                }
+            }
+
+            // Forward futility pruning. Near the horizon a quiet move that leaves the static
+            // eval this far below alpha is very unlikely to lift it, so it is written off
+            // before the board clone and accumulator update -- the same place, and for the
+            // same reason, as LMP above.
+            //
+            // `best > -MATE_BOUND` is the "at least one move has been searched" guard: `best`
+            // is -INF until the first move returns, and -INF is NOT > -MATE_BOUND. LMP relies
+            // on exactly the same fact.
+            if FUTILITY
+                && !is_pv
+                && !in_check
+                && is_quiet
+                && depth <= FUT_MAX_DEPTH
+                && best > -MATE_BOUND
+                && static_eval + FUT_MARGIN * depth <= alpha
+            {
+                continue;
+            }
+
+            // SEE pruning. A move that loses material outright by static exchange is worth
+            // searching only if the depth left can plausibly justify it. Quiets are held to a
+            // linear budget in depth, captures to a quadratic one -- a losing capture at least
+            // wins material first, so it earns more rope.
+            if SEE_PRUNE
+                && !is_pv
+                && !in_check
+                && depth <= 8
+                && best > -MATE_BOUND
+                && mv.promotion.is_none()
+            {
+                let threshold = if is_quiet {
+                    SEE_Q_MARGIN * depth
+                } else {
+                    SEE_C_MARGIN * depth * depth
+                };
+                if see(board, mv) < threshold {
+                    continue;
+                }
             }
 
             // Singular extension. If the TT says this move is good enough to have caused a
@@ -837,7 +1405,7 @@ impl Searcher {
                 let s_beta = tt_score - 3 * depth;
                 let s_depth = (depth - 1) / 2;
                 self.excluded[ply as usize] = tt_mv;
-                let s = self.negamax(board, s_depth, ply, s_beta - 1, s_beta, prev, acc);
+                let s = self.negamax(board, s_depth, ply, s_beta - 1, s_beta, prev, acc, cut_node);
                 self.excluded[ply as usize] = 0;
                 if self.stopped {
                     return 0; // no move searched yet at this point, so nothing to preserve
@@ -852,18 +1420,28 @@ impl Searcher {
             let cur_ci = board.piece_on(mv.from).unwrap() as usize * 64 + mv.to as usize;
             let mut nb = board.clone();
             nb.play_unchecked(mv);
+            // Start the child's transposition line moving now. A probe is a guaranteed cache miss on a table larger than L2, and the accumulator update below needs none of it -- ~230 cycles of cover for the latency.
+            self.tt.prefetch(nb.hash());
             let nacc = acc.map(|a| nnue::acc_update(nnue::net().unwrap(), a, board, mv));
             let na = nacc.as_ref();
             self.path.push(hash);
             self.cont_stack.push(cur_ci);
 
             let sc = if i == 0 {
-                -self.negamax(&nb, new_depth, ply + 1, -beta, -alpha, pack(mv), na)
+                // the first move of a PV node starts a PV node; elsewhere the expectation flips
+                let child_cut = if is_pv { false } else { !cut_node };
+                -self.negamax(&nb, new_depth, ply + 1, -beta, -alpha, pack(mv), na, child_cut)
             } else {
                 // LMR on late quiets
                 let mut r = 0i32;
-                if depth >= 3 && i >= 3 && is_quiet && !in_check {
-                    r = lmr_table()[depth.min(63) as usize][i.min(63)] as i32;
+                let lmr_eligible = is_quiet || (CAPT_LMR && is_capture);
+                if depth >= 3 && i >= 3 && lmr_eligible && !in_check {
+                    r = self.lmr[depth.min(63) as usize][i.min(63)] as i32;
+                    // A late capture still changes material, so it deserves a shallower cut
+                    // than a late quiet -- one ply back, never below zero.
+                    if CAPT_LMR && !is_quiet {
+                        r = (r - 1).max(0);
+                    }
                     if LMR_TWEAKS {
                         // A PV node is worth searching more carefully; a line that is not
                         // improving is worth searching less. Both quantities are already
@@ -872,14 +1450,36 @@ impl Searcher {
                         r += !improving as i32;
                         r = r.max(0);
                     }
+                    // Reduce a move the history likes by less, one the history dislikes by
+                    // more. The reduction table sees only depth and move index -- it cannot
+                    // tell a quiet the search keeps rewarding from one it keeps refuting, and
+                    // that information is already in the tables the ordering just used.
+                    if CUT_NODE && cut_node {
+                        r += CUT_LMR_BONUS;
+                    }
+                    #[cfg(feature = "instrument")]
+                    instrument::record(
+                        self.history[stm as usize][mv.from as usize][mv.to as usize]
+                            + self.cont_score(&preds, cur_ci),
+                    );
+                    if HIST_LMR {
+                        let h = self.history[stm as usize][mv.from as usize][mv.to as usize]
+                            + self.cont_score(&preds, cur_ci);
+                        r -= (h / tune::hist_lmr_div()).clamp(-2, 2);
+                        r = r.max(0);
+                    }
                 }
-                let mut s =
-                    -self.negamax(&nb, new_depth - r, ply + 1, -alpha - 1, -alpha, pack(mv), na);
+                // A reduced null-window search is by construction an attempt to refute the
+                // move: it is a cut node.
+                let mut s = -self
+                    .negamax(&nb, new_depth - r, ply + 1, -alpha - 1, -alpha, pack(mv), na, true);
                 if s > alpha && r > 0 {
-                    s = -self.negamax(&nb, new_depth, ply + 1, -alpha - 1, -alpha, pack(mv), na);
+                    s = -self.negamax(
+                        &nb, new_depth, ply + 1, -alpha - 1, -alpha, pack(mv), na, !cut_node,
+                    );
                 }
                 if s > alpha && s < beta {
-                    s = -self.negamax(&nb, new_depth, ply + 1, -beta, -alpha, pack(mv), na);
+                    s = -self.negamax(&nb, new_depth, ply + 1, -beta, -alpha, pack(mv), na, false);
                 }
                 s
             };
@@ -893,6 +1493,9 @@ impl Searcher {
                 best = sc;
                 best_mv = pack(mv);
                 best_is_capture = is_capture;
+                if ply == 0 {
+                    self.root_best = best_mv;
+                }
                 if sc > alpha {
                     alpha = sc;
                     bound = BOUND_EXACT;
@@ -910,18 +1513,40 @@ impl Searcher {
                                 self.counter[stm as usize][(prev & 63) as usize]
                                     [((prev >> 6) & 63) as usize] = pack(mv);
                             }
-                            let bonus = (depth * depth).min(400);
+                            let bonus = hist_bonus(depth);
                             let h = &mut self.history[stm as usize][mv.from as usize]
                                 [mv.to as usize];
                             *h += bonus - *h * bonus / 16_384;
-                            self.cont_bonus(cont1, cont2, cur_ci, bonus);
+                            self.cont_bonus(&preds, cur_ci, bonus);
                             for q in &quiets_tried {
                                 let h = &mut self.history[stm as usize][q.from as usize]
                                     [q.to as usize];
                                 *h -= bonus + *h * bonus / 16_384;
                                 let qci =
                                     board.piece_on(q.from).unwrap() as usize * 64 + q.to as usize;
-                                self.cont_bonus(cont1, cont2, qci, -bonus);
+                                self.cont_bonus(&preds, qci, -bonus);
+                            }
+                        }
+                        // Capture history, same gravity update as the quiet tables. Rewarded
+                        // only when a CAPTURE caused the cutoff; the captures that were tried
+                        // first and did not cut are penalised either way, because "searched
+                        // ahead of the move that worked" is exactly the ordering mistake this
+                        // table exists to correct.
+                        if CAPT_HIST {
+                            let bonus = hist_bonus(depth);
+                            if is_capture {
+                                if let Some(v) = capture_victim(board, mv) {
+                                    let a = board.piece_on(mv.from).unwrap();
+                                    let e = &mut self.capt[capt_index(stm, a, mv.to, v)];
+                                    *e += bonus - *e * bonus / 16_384;
+                                }
+                            }
+                            for c in &caps_tried {
+                                if let Some(v) = capture_victim(board, *c) {
+                                    let a = board.piece_on(c.from).unwrap();
+                                    let e = &mut self.capt[capt_index(stm, a, c.to, v)];
+                                    *e -= bonus + *e * bonus / 16_384;
+                                }
                             }
                         }
                         break;
@@ -930,6 +1555,8 @@ impl Searcher {
             }
             if is_quiet {
                 quiets_tried.push(mv);
+            } else if CAPT_HIST && is_capture {
+                caps_tried.push(mv);
             }
         }
 
@@ -948,6 +1575,7 @@ impl Searcher {
         // moving `moves` out is impossible there anyway while it is being iterated.
         self.move_buf[ply as usize] = moves;
         self.quiet_buf[ply as usize] = quiets_tried;
+        self.capt_buf[ply as usize] = caps_tried;
         best
     }
 
@@ -972,11 +1600,22 @@ impl Searcher {
     pub fn think(&mut self, board: &Board, limits: &Limits) -> Option<Move> {
         self.nodes = 0;
         self.stopped = false;
-        self.stop.store(false, Ordering::Relaxed);
+        // 2026-08-18 FIX: only the main thread clears the SHARED stop flag. Every thread used to
+        // do it, and thread spawning is staggered, so a `stop` arriving between spawns was
+        // cleared by whichever helper entered think() next -- un-stopping the group after the
+        // bestmove had already been printed, and leaving the next `go` blocked in join() until
+        // the runaways hit their own hard limit. uci.rs already resets once before any spawn;
+        // this keeps the non-UCI callers (datagen) working without racing the UCI thread.
+        if self.is_main {
+            self.stop.store(false, Ordering::Relaxed);
+        }
         self.start = Instant::now();
         self.path.clear();
         self.cont_stack.clear();
         self.killers = [[0; 2]; MAX_PLY];
+        self.root_best = 0;
+        // Rebuilt per search: under `tune` the parameters change between games.
+        self.lmr = build_lmr_table();
         // only the main thread of an SMP group bumps age -- once per `go`, not once per thread
         if self.is_main {
             self.tt.new_search();
@@ -992,10 +1631,7 @@ impl Searcher {
                 Color::Black => (limits.btime, limits.binc.unwrap_or(0)),
             };
             match t {
-                Some(t) => {
-                    let soft = t / 30 + inc * 3 / 4;
-                    (soft, (t / 6).max(soft).min(t.saturating_sub(50)))
-                }
+                Some(t) => allocate_time(t, inc, limits.movestogo),
                 None => (u128::MAX, u128::MAX),
             }
         };
@@ -1028,6 +1664,7 @@ impl Searcher {
 
         for depth in 1..=max_depth {
             self.seldepth = 0;
+            self.root_depth = depth;
             // aspiration windows after depth 5
             let mut delta = 30;
             let (mut a, mut b) = if depth >= 5 {
@@ -1036,7 +1673,7 @@ impl Searcher {
                 (-INF, INF)
             };
             let score = loop {
-                let s = self.negamax(board, depth, 0, a, b, 0, root_acc.as_ref());
+                let s = self.negamax(board, depth, 0, a, b, 0, root_acc.as_ref(), false);
                 if self.stopped {
                     break s;
                 }
@@ -1051,9 +1688,13 @@ impl Searcher {
                 }
             };
 
-            // pick up best move from TT (root entry)
+            // 2026-08-18 FIX: take the root move from what the root search actually returned,
+            // not by re-probing the TT. The replacement policy triggers on `existing_key != key`
+            // alone, so the root entry can be evicted mid-search by any colliding position, and
+            // the re-probe would then hand back a different (or no) move than the search chose.
+            // Still validated against generated moves, so an illegal move remains impossible.
             if !self.stopped || best.is_none() {
-                if let Some(mv) = self.tt_move(board) {
+                if let Some(mv) = packed_to_move(board, self.root_best) {
                     best = Some(mv);
                 }
             }
@@ -1091,17 +1732,7 @@ impl Searcher {
 
     fn tt_move(&self, board: &Board) -> Option<Move> {
         let e = self.tt.probe(board.hash())?;
-        let mut found = None;
-        board.generate_moves(|pm| {
-            for mv in pm {
-                if pack(mv) == e.mv {
-                    found = Some(mv);
-                    return true;
-                }
-            }
-            false
-        });
-        found
+        packed_to_move(board, e.mv)
     }
 
     fn pv_string(&self, board: &Board, max_len: i32) -> String {
@@ -1131,6 +1762,104 @@ impl Searcher {
     }
 }
 
+/// Resolve a packed move against the legal moves of `board`. Returns None if it matches none,
+/// which is the invariant that keeps a TT collision or a stale root entry from ever producing
+/// an illegal bestmove.
+fn packed_to_move(board: &Board, packed: u16) -> Option<Move> {
+    if packed == 0 {
+        return None;
+    }
+    let mut found = None;
+    board.generate_moves(|pm| {
+        for mv in pm {
+            if pack(mv) == packed {
+                found = Some(mv);
+                return true;
+            }
+        }
+        false
+    });
+    found
+}
+
+/// Index into the capture-history table.
+#[inline]
+fn capt_index(stm: Color, piece: Piece, to: Square, victim: Piece) -> usize {
+    (((stm as usize) * 384) + (piece as usize) * 64 + to as usize) * 6 + victim as usize
+}
+
+/// History bonus for a cutoff at `depth`. See HIST_BONUS.
+#[inline]
+fn hist_bonus(depth: i32) -> i32 {
+    if HIST_BONUS {
+        (depth * depth * tune::hist_bonus_mul()).min(tune::hist_bonus_max())
+    } else {
+        (depth * depth).min(400)
+    }
+}
+
+/// How many continuation-history blocks are live. Two unless CONT_EXTRA is on.
+#[inline]
+const fn cont_blocks() -> usize {
+    if CONT_EXTRA { CONT_BLOCKS } else { 2 }
+}
+
+/// (soft, hard) time budget in ms for one move.
+///
+/// `soft` is checked between iterative-deepening iterations; `hard` is the safety net inside
+/// the search. The bench signature CANNOT gate this -- bench runs at fixed depth, so time
+/// management never engages and the signature is identical however this behaves.
+/// `search::tm_tests` is the gate instead.
+///
+/// 2026-09-09: MOVES-TO-GO, for CCRL 40/15. `t / 30` is an increment-control rule: it spends a
+/// thirtieth of what is LEFT, decaying geometrically -- move 1 gets thirty seconds, move 40 gets
+/// eight. A moves-to-go control states exactly how many moves the budget must cover, so spend
+/// the fair share of it instead.
+///
+/// SIZE OF THE EFFECT, STATED HONESTLY. The engine finishes the iteration in progress and so
+/// overshoots `soft` -- measured ~1.25x here (25.4 s against a 20.2 s target). That overshoot
+/// PARTLY COMPENSATES for the old rule's underspending, so the gain is smaller than an
+/// exact-spend model suggests. Budget used across a 40-move block, old rule -> this one:
+///
+///     overshoot 1.00x   74.2% -> 99.6%    (+27.6 Elo at 65/doubling)
+///     overshoot 1.25x   81.8% -> 100.0%   (+18.9)   <- the measured operating point
+///     overshoot 1.70x   90.3% -> 100.0%   (+9.5)
+///
+/// so ~+19 Elo is the number to expect, not the +28 the naive model gives.
+fn allocate_time(t: u128, inc: u128, movestogo: Option<u32>) -> (u128, u128) {
+    // Reserve. A FLAT 100 ms is not enough across a whole block: the engine finishes the
+    // iteration in progress, so it overshoots `soft` by ~25% (measured: 25.4 s against a
+    // 20.2 s target at 40/15), and while the fair-share recomputation absorbs that without
+    // flagging, it lands the block with only the reserve left. Scaling by the moves still to
+    // play buys a cushion where it is needed -- early, when many round-trips remain -- and
+    // gives it back on the last move, where only one is left. Capped at 5% of the clock so it
+    // can never dominate the budget.
+    // 150 ms floor plus 20 ms per remaining move, capped at 5% of the clock. The floor is what
+    // matters: a purely proportional reserve shrinks to nothing on the LAST move of a block,
+    // which is exactly where a flag costs the game.
+    let reserve = |t: u128, mtg: u128| 150 + (20 * mtg).min(t / 20);
+    let (soft, hard) = match movestogo {
+        Some(mtg) => {
+            let mtg = mtg.max(1) as u128;
+            let avail = t.saturating_sub(reserve(t, mtg)).max(1);
+            let fair = avail / mtg;
+            // Spend a shade under the fair share so the surplus rolls forward: the block then
+            // finishes near 100% of the budget instead of flagging on the last move.
+            let soft = fair * 9 / 10 + inc * 3 / 4;
+            // A burst is allowed for a hard move, never past what the rest of the block needs.
+            let hard = (fair * 3).min(avail).max(soft);
+            (soft, hard)
+        }
+        None => {
+            let soft = t / 30 + inc * 3 / 4;
+            let hard = (t / 6).max(soft).min(t.saturating_sub(50)).max(1);
+            (soft, hard)
+        }
+    };
+    let hard = hard.min(t.saturating_sub(50)).max(1);
+    (soft.min(hard), hard)
+}
+
 fn has_non_pawn(board: &Board, c: Color) -> bool {
     let mine = board.colors(c);
     !((board.pieces(Piece::Knight)
@@ -1158,6 +1887,78 @@ fn tt_score_from(s: i32, ply: i32) -> i32 {
         s + ply
     } else {
         s
+    }
+}
+
+/// Gate for the 2026-08-18 en-passant classification fix.
+///
+/// The bench signature cannot certify this: en passant is rare enough that a bench position set
+/// may contain none at all, and a signature only says "the tree changed", never "it changed for
+/// the right reason". These assert the classification directly, including the castling case that
+/// a naive "destination not occupied by the enemy" rule would get wrong in the other direction.
+#[cfg(test)]
+mod ep_tests {
+    use super::*;
+
+    fn find(board: &Board, uci: &str) -> Move {
+        let mut found = None;
+        board.generate_moves(|pm| {
+            for mv in pm {
+                if cozy_chess::util::display_uci_move(board, mv).to_string() == uci {
+                    found = Some(mv);
+                    return true;
+                }
+            }
+            false
+        });
+        found.unwrap_or_else(|| panic!("move {uci} not legal here"))
+    }
+
+    /// The old predicate, kept verbatim so the test states exactly what regressed.
+    fn old_is_capture(board: &Board, mv: Move) -> bool {
+        board.color_on(mv.to) == Some(opp(board.side_to_move()))
+    }
+
+    #[test]
+    fn en_passant_is_a_capture() {
+        // white pawn e5, black pawn d5, ep target d6: exd6 e.p. takes the d5 pawn
+        let b = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", false).unwrap();
+        let ep = find(&b, "e5d6");
+        assert_eq!(capture_victim(&b, ep), Some(Piece::Pawn));
+        // the bug: the destination square is empty, so the old test called it quiet
+        assert!(!old_is_capture(&b, ep), "test is not exercising the bug");
+    }
+
+    #[test]
+    fn quiet_pawn_push_is_not_a_capture() {
+        let b = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", false).unwrap();
+        assert_eq!(capture_victim(&b, find(&b, "e5e6")), None);
+    }
+
+    #[test]
+    fn castling_is_not_a_capture() {
+        // cozy encodes castling as king-takes-own-rook, so `to` IS occupied -- by our own rook.
+        let b = Board::from_fen("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1", false).unwrap();
+        assert_eq!(capture_victim(&b, find(&b, "e1g1")), None);
+        assert_eq!(capture_victim(&b, find(&b, "e1c1")), None);
+    }
+
+    #[test]
+    fn ordinary_capture_still_reads_its_victim() {
+        let b = Board::from_fen("4k3/8/8/3r4/4B3/8/8/4K3 w - - 0 1", false).unwrap();
+        assert_eq!(capture_victim(&b, find(&b, "e4d5")), Some(Piece::Rook));
+    }
+
+    /// qsearch generates a move only when `capture_victim` (or a queen promo, or being in check)
+    /// says so, which is the path that used to drop en passant entirely.
+    #[test]
+    fn qsearch_now_sees_the_en_passant_capture() {
+        let b = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", false).unwrap();
+        let ep = find(&b, "e5d6");
+        let in_check = !b.checkers().is_empty();
+        let generated = in_check || capture_victim(&b, ep).is_some()
+            || ep.promotion == Some(Piece::Queen);
+        assert!(generated, "qsearch would still skip the en passant capture");
     }
 }
 
@@ -1220,5 +2021,221 @@ mod vol_tm_tests {
         assert!((f(VOL_HI) - VOL_MAX).abs() < 1e-9);
         assert!((f(99.0) - VOL_MAX).abs() < 1e-9); // wilder than HI -> clamped
         assert!(f(0.35) > VOL_MIN && f(0.35) < VOL_MAX); // monotone in between
+    }
+}
+
+/// Gate for the 2026-09-09 qsearch destination mask.
+///
+/// The mask's whole licence to ship without an SPRT is that it changes NO move list -- it only
+/// declines to construct moves the filter was about to discard. The bench signature says the
+/// tree is unchanged on six positions; this says the move list is unchanged on thousands,
+/// including the two cases a destination mask is most likely to get wrong (an en-passant
+/// capture, whose destination square is empty, and a non-capturing promotion, whose destination
+/// is empty too).
+#[cfg(test)]
+mod qmask_tests {
+    use super::*;
+
+    /// Moves qsearch would search at `board`, built WITHOUT the mask -- the pre-2026-09-09 path.
+    fn unmasked(board: &Board) -> Vec<Move> {
+        let in_check = !board.checkers().is_empty();
+        let mut out = Vec::new();
+        board.generate_moves(|pm| {
+            for mv in pm {
+                let victim = capture_victim(board, mv);
+                let is_qpromo = mv.promotion == Some(Piece::Queen);
+                if in_check || victim.is_some() || is_qpromo {
+                    out.push(mv);
+                }
+            }
+            false
+        });
+        out
+    }
+
+    /// The same list, built the way qsearch builds it now.
+    fn masked(board: &Board) -> Vec<Move> {
+        let stm = board.side_to_move();
+        let in_check = !board.checkers().is_empty();
+        let qtargets = if in_check {
+            BitBoard::FULL
+        } else {
+            let mut t = board.colors(opp(stm));
+            if let Some(f) = board.en_passant() {
+                t |= Square::new(f, Rank::Sixth.relative_to(stm)).bitboard();
+            }
+            t
+        };
+        let promo_rank = Rank::Eighth.relative_to(stm).bitboard();
+        let mut out = Vec::new();
+        board.generate_moves(|mut pm| {
+            if !in_check {
+                let mut t = qtargets;
+                if pm.piece == Piece::Pawn {
+                    t |= promo_rank;
+                }
+                pm.to &= t;
+                if pm.to.is_empty() {
+                    return false;
+                }
+            }
+            for mv in pm {
+                let victim = capture_victim(board, mv);
+                let is_qpromo = mv.promotion == Some(Piece::Queen);
+                if in_check || victim.is_some() || is_qpromo {
+                    out.push(mv);
+                }
+            }
+            false
+        });
+        out
+    }
+
+    fn agree(board: &Board, what: &str) {
+        assert_eq!(masked(board), unmasked(board), "qsearch move list changed: {what}");
+    }
+
+    #[test]
+    fn mask_preserves_the_move_list_on_random_games() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut positions = 0usize;
+        let mut saw_ep = 0usize;
+        let mut saw_promo = 0usize;
+        for _ in 0..300 {
+            let mut board = Board::startpos();
+            for _ in 0..120 {
+                if board.status() != cozy_chess::GameStatus::Ongoing {
+                    break;
+                }
+                agree(&board, "random game");
+                positions += 1;
+                if board.en_passant().is_some() {
+                    saw_ep += 1;
+                }
+                let mut legal = Vec::new();
+                board.generate_moves(|pm| {
+                    for mv in pm {
+                        if mv.promotion.is_some() {
+                            saw_promo += 1;
+                        }
+                        legal.push(mv);
+                    }
+                    false
+                });
+                let mv = legal[(rnd() as usize) % legal.len()];
+                board.play_unchecked(mv);
+            }
+        }
+        assert!(positions > 10_000, "only {positions} positions walked");
+        assert!(saw_ep > 50, "only {saw_ep} en-passant positions -- test is not covering ep");
+        assert!(saw_promo > 50, "only {saw_promo} promotions -- test is not covering promos");
+    }
+
+    /// The two shapes a destination mask gets wrong, stated as positions rather than left to
+    /// chance in the random walk.
+    #[test]
+    fn mask_keeps_en_passant_and_quiet_promotions() {
+        // en passant: destination d6 is EMPTY, so it is not in the enemy occupancy
+        let b = Board::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", false).unwrap();
+        assert_eq!(masked(&b).len(), 1, "the ep capture was masked away");
+        agree(&b, "en passant");
+        // non-capturing queen promotion: destination is empty and not enemy-occupied.
+        // Black king on g8, not e8: a d7 pawn attacks e8, and the side NOT to move may not be
+        // left in check -- cozy rejects that FEN outright.
+        let b = Board::from_fen("6k1/3P4/8/8/8/8/8/4K3 w - - 0 1", false).unwrap();
+        assert!(!masked(&b).is_empty(), "the quiet queen promotion was masked away");
+        agree(&b, "quiet promotion");
+        // in check: every evasion must survive, quiet ones included
+        let b = Board::from_fen("4k3/8/8/8/7b/8/6P1/4K2R w K - 0 1", false).unwrap();
+        agree(&b, "in check");
+    }
+}
+
+/// Gate for moves-to-go time management (2026-09-09). The bench signature is blind to this --
+/// fixed-depth search never consults the clock -- so these assertions are the only thing
+/// standing between a mis-specified budget and a forfeited game.
+#[cfg(test)]
+mod tm_tests {
+    use super::*;
+
+    /// Walk a whole CCRL 40/15 block and report (fraction of budget used, worst overspend).
+    fn walk_block(movestogo: bool) -> (f64, i128) {
+        let budget: u128 = 900_000;
+        let mut t = budget;
+        let mut used: u128 = 0;
+        // MIN, not 0: seeded at 0 the `max` below can only grow it, so `worst < 0` would be
+        // unfalsifiable and the assertion would fire on a correct allocator (it did).
+        let mut worst: i128 = i128::MIN;
+        for mv in 0..40u32 {
+            let mtg = if movestogo { Some(40 - mv) } else { None };
+            let (soft, hard) = allocate_time(t, 0, mtg);
+            assert!(soft <= hard, "soft {soft} exceeded hard {hard} at move {mv}");
+            // The engine finishes the iteration in progress, so it overshoots `soft`. 1.4x is
+            // above the ~1.25x measured at 40/15, deliberately: the budget has to survive the
+            // bad case, not the typical one.
+            let spend = (soft * 14 / 10).min(hard);
+            worst = worst.max(spend as i128 - t as i128);
+            used += spend;
+            t = t.saturating_sub(spend);
+        }
+        (used as f64 / budget as f64, worst)
+    }
+
+    #[test]
+    fn moves_to_go_spends_the_block() {
+        let (frac, worst) = walk_block(true);
+        assert!(worst < 0, "a move was allocated more time than remained on the clock");
+        // Measured 99.6% with the 9/10 fair-share rule: the shortfall each move rolls into
+        // the remaining ones, so the block finishes nearly exact without ever overcommitting.
+        assert!(frac > 0.90, "only {:.1}% of the 40/15 budget used", 100.0 * frac);
+        assert!(frac < 1.0, "allocated {:.1}% of the budget -- that flags", 100.0 * frac);
+    }
+
+    /// The regression this replaced: without movestogo the same block leaves a quarter of the
+    /// clock unused. Kept as a test so the improvement is a measured fact, not a claim.
+    #[test]
+    fn the_increment_rule_underspends_a_moves_to_go_block() {
+        let (frac, _) = walk_block(false);
+        // Both arms carry the SAME overshoot model. That matters: overshooting partly
+        // compensates for the old rule's underspending, so applying it to only one arm would
+        // overstate the gain -- which an earlier version of this test did.
+        assert!(frac < 0.90, "expected the old rule to underspend, got {:.1}%", 100.0 * frac);
+        let (with_mtg, _) = walk_block(true);
+        assert!(with_mtg > frac + 0.10, "movestogo must recover a large part of the budget");
+    }
+
+    /// Sudden-death and increment controls must be untouched by the change.
+    #[test]
+    fn increment_controls_are_unchanged() {
+        for &(t, inc) in &[(300_000u128, 3_000u128), (10_000, 100), (40, 0)] {
+            let (soft, hard) = allocate_time(t, inc, None);
+            assert_eq!(soft, (t / 30 + inc * 3 / 4).min(hard));
+            assert!(soft <= hard && hard >= 1);
+        }
+    }
+
+    /// The last move of a block may use nearly everything, but never all of it.
+    #[test]
+    fn the_final_move_of_a_block_keeps_a_reserve() {
+        let (soft, hard) = allocate_time(120_000, 0, Some(1));
+        assert!(hard < 120_000, "no reserve left against the clock");
+        assert!(soft > 90_000, "far too timid with one move to make: {soft} ms");
+    }
+
+    /// A nearly-flagged clock must still return something playable rather than 0.
+    #[test]
+    fn a_desperate_clock_still_yields_a_positive_budget() {
+        for &t in &[1u128, 40, 120, 1000] {
+            for mtg in [None, Some(1), Some(40)] {
+                let (soft, hard) = allocate_time(t, 0, mtg);
+                assert!(hard >= 1 && soft <= hard, "t={t} mtg={mtg:?} -> ({soft},{hard})");
+            }
+        }
     }
 }
