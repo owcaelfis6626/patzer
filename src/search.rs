@@ -97,6 +97,17 @@ const CAPT_HIST: bool = true;  // history table for capture ordering, beyond MVV
 // search will hold. 512 makes the term bite on roughly a tenth of LMR'd moves at depth 16 and
 // more above that; it is exposed to SPSA rather than trusted.
 const HIST_LMR: bool = true;
+// Reuse the ordering score as the HIST_LMR input instead of reloading the history tables.
+//
+// NOT BIT-EXACT, AND THAT IS THE FINDING. A history-scored quiet's ordering score IS
+// `history + cont_score` at the moment it is computed -- but those tables are MUTATED during
+// this very node's move loop, by the child searches it launches (cont_bonus, and the history
+// updates on a fail-high). The original code therefore reads a FRESH value at the LMR site,
+// while reusing the score reads an entry-time SNAPSHOT. Measured: signature 270698 against the
+// champion's 284537. Defensible as a design choice -- ordering-time consistency is arguably what
+// you want -- but it changes the tree and needs an SPRT, so it is not the free win it appears to
+// be. Left gated rather than discarded; tag::IS_HIST_SCORE carries the distinction for free.
+const HIST_LMR_REUSE: bool = false;
 const RAZOR: bool = false;      // drop to qsearch when the static eval is far below alpha
 const NMP_VERIFY: bool = false; // verify a null-move cutoff with a null-disabled re-search
 const NMP_VERIFY_DEPTH: i32 = 8;// only above this depth; below it the re-search costs more than it saves
@@ -273,6 +284,40 @@ pub mod tune {
     pub const RFP_MARGIN: i32 = 120;   // reverse-futility margin per ply
     pub const NMP_BASE: i32 = 3;       // null-move reduction, constant part
     pub const NMP_DIV: i32 = 5;        // null-move reduction, depth divisor
+    // SWEPT, THEN REFUTED BY SPRT -- both halves matter, 2026-09-10.
+    //
+    // Measured against 250 real games vs stash-v26: patzer reaches mean depth 21.92 where stash
+    // reaches 29.38 at the same 1.35 s/move, decomposing into EBF 1.689 vs 1.510 and nps 1.26M
+    // vs 2.60M. Sweeping these constants for depth-at-fixed-time found exactly one that moves
+    // the tree. Bench tree against the champion's 284537:
+    //
+    //     LMR_DIV 225->180   238763  (-16.1%)    LMR_DIV 225->150   222572  (-21.8%)
+    //     LMR_BASE 75->100   280086   (-1.6%)    both               235557  (-17.2%)
+    //     NMP_BASE 3->4      297199   (+4.5%)    LMP_BASE 3->2      317956  (+11.8%)
+    //
+    // NMP_BASE and LMP_BASE are nominally MORE aggressive and make the tree BIGGER -- they prune
+    // moves that were about to cause cutoffs, so the node is searched more widely instead. All
+    // four together FAIL the `mates` gate while each alone passes: over-pruning caught by a
+    // correctness gate rather than a wasted SPRT.
+    //
+    // AND THEN THE SPRT KILLED THE PRESCRIPTION. LMR_DIV=180 -- the "one live lever" -- measured
+    // -26.86 +/- 20.63 over 350 games at 10+0.1, CI entirely below zero, bundled with a bit-exact
+    // speed win that could only have helped. Proof the speed win was not the cause:
+    // patzer-O_lmrdiv180 and patzer-R_pmpiece_lmr180 bench the IDENTICAL 238763 tree, and R ran
+    // 1423 knps against O's 1334 -- strictly faster on the same tree, and it still lost. So
+    // LMR_DIV=180 costs roughly -35 Elo by itself.
+    //
+    // The EBF decomposition is sound as a DESCRIPTION and wrong as a PRESCRIPTION: pruning harder
+    // does close the gap toward stash's 1.510, and loses Elo doing it. Stash's lower EBF comes
+    // from ordering or eval shape, not from timider reductions here. DO NOT tune these toward a
+    // smaller tree -- and note SPSA optimises SCORE, not tree size, so it is unaffected by this.
+    //
+    // THIRD TIME IN ONE DAY THAT BENCH TREE SIZE MISLED A DECISION:
+    //     CONT_EXTRA   -10.3% tree ->  -0.87 +/- 19.4  (null)
+    //     HIST_PRUNE    -5.4% tree ->  +1.74 +/- 21.3  (null)
+    //     LMR_DIV=180  -16.1% tree -> -26.86 +/- 20.6  (negative)
+    // Tree size is ANTI-CORRELATED with Elo when the shrinkage comes from pruning harder. Use the
+    // bench signature for "did this change anything", never for "is this better".
     pub const LMP_BASE: i32 = 3;       // late-move-pruning schedule offset
     pub const LMR_BASE: i32 = 75;      // LMR table intercept, x100
     pub const LMR_DIV: i32 = 225;      // LMR table divisor, x100
@@ -412,15 +457,44 @@ fn opp(c: Color) -> Color {
 #[inline]
 fn capture_victim(board: &Board, mv: Move) -> Option<Piece> {
     let stm = board.side_to_move();
-    if board.color_on(mv.to) == Some(opp(stm)) {
+    capture_victim_with(board, mv, board.colors(opp(stm)), ep_square(board, stm))
+}
+
+/// The en-passant destination square, if any.
+#[inline]
+fn ep_square(board: &Board, stm: Color) -> Option<Square> {
+    board
+        .en_passant()
+        .map(|f| Square::new(f, Rank::Sixth.relative_to(stm)))
+}
+
+/// F4 (2026-09-10): the hot-path form, taking the enemy occupancy and en-passant square the
+/// caller already has.
+///
+/// The original cost every QUIET move a `board.color_on(mv.to)` (two bitboard tests) plus a
+/// `board.piece_on(mv.from)` to discover it was not a pawn -- and cozy's `piece_on` is a linear
+/// scan of up to six bitboards. So a non-pawn quiet paid ~8 tests to be told "not a capture",
+/// once per move per node, plus again in qsearch's delta-pruning pass.
+///
+/// Here a capture costs ONE test, and the en-passant branch is skipped entirely when there is no
+/// en-passant square -- which is almost always. `mv.to == ep` already implies the diagonal (the
+/// square behind a double-pushed pawn is never reachable by a straight push, since the pusher's
+/// own origin would have to be the occupied square the pawn just left), so the file comparison
+/// and the `piece_on(mv.to).is_none()` check are both redundant; pawn-ness is one bitboard test.
+#[inline]
+fn capture_victim_with(
+    board: &Board,
+    mv: Move,
+    enemy: BitBoard,
+    ep: Option<Square>,
+) -> Option<Piece> {
+    if enemy.has(mv.to) {
         return board.piece_on(mv.to);
     }
-    // en passant: a pawn moving diagonally onto an empty square
-    if board.piece_on(mv.from) == Some(Piece::Pawn)
-        && mv.from.file() != mv.to.file()
-        && board.piece_on(mv.to).is_none()
-    {
-        return Some(Piece::Pawn);
+    if let Some(epsq) = ep {
+        if mv.to == epsq && board.pieces(Piece::Pawn).has(mv.from) {
+            return Some(Piece::Pawn);
+        }
     }
     None
 }
@@ -567,6 +641,10 @@ pub struct Searcher {
     eval_hist: [i32; MAX_PLY],
     // move excluded at each ply during a singular-verification search (0 = none)
     excluded: [u16; MAX_PLY],
+    // F5: the loaded network, resolved ONCE per search instead of per move. `nnue::net()` is a
+    // OnceLock::get -- an atomic load plus a branch -- and it sat on the accumulator-update path
+    // (once per make) and the eval path (once per node).
+    net: Option<&'static nnue::Network>,
     // LMR reduction table, rebuilt once per search in think() (see build_lmr_table)
     lmr: [[i8; 64]; 64],
     // Ply at which null-move pruning is currently suppressed (-1 = nowhere). Set only around a
@@ -598,9 +676,9 @@ pub struct Searcher {
     // Owned by the Searcher and reused: the buffers keep their capacity for the life of
     // the search. Taken out with mem::take while in use so `self` stays borrowable for
     // the recursive call, and put back on the paths that matter.
-    move_buf: Vec<Vec<(i32, Move)>>,
-    qmove_buf: Vec<Vec<(i32, Move)>>,
-    quiet_buf: Vec<Vec<Move>>,
+    move_buf: Vec<Vec<(i32, Move, u8)>>,
+    qmove_buf: Vec<Vec<(i32, Move, u8)>>,
+    quiet_buf: Vec<Vec<(Move, usize)>>,
     pub nodes: u64,
     seldepth: i32,
     start: Instant,
@@ -643,6 +721,7 @@ impl Searcher {
             cont_stack: Vec::with_capacity(MAX_PLY + 4),
             eval_hist: [0; MAX_PLY],
             excluded: [0; MAX_PLY],
+            net: None,
             lmr: [[0i8; 64]; 64],
             root_best: 0,
             nmp_off_ply: -1,
@@ -677,8 +756,59 @@ impl Searcher {
         self.stopped
     }
 
-    fn is_repetition(&self, hash: u64) -> bool {
-        self.path.iter().rev().any(|&h| h == hash) || self.game_hist.iter().any(|&h| h == hash)
+    /// Has `hash` occurred before, within reach of a repetition?
+    ///
+    /// 2026-09-10: this used to scan the WHOLE of `game_hist` with `.any()` at every node. A
+    /// BENCH-INVISIBLE COST: bench constructs each position fresh so `game_hist` is always empty,
+    /// and the engine's primary instrument therefore cannot see this at all. Measured under real
+    /// conditions instead -- same position, 4,000,000 nodes pinned, reached via FEN (no history)
+    /// versus via 90 moves -- it was **+5.3% slower per node** with a 90-ply history, and the cost
+    /// grows linearly with move number. CCRL 40/15 games routinely run past 120 plies.
+    ///
+    /// Two bounds, both exact rather than heuristic:
+    ///
+    ///  * A repetition cannot reach past the last irreversible move, so only the most recent
+    ///    `halfmove_clock` plies can possibly match. Anything older differs in material or pawn
+    ///    structure and so differs in hash.
+    ///  * Only EVEN plies back can match, because the side to move is part of the hash (verified:
+    ///    the same placement with white and with black to move hashes differently). The immediate
+    ///    parent has the opposite mover, so the scan starts two plies back and steps by two.
+    ///
+    /// Both only remove comparisons that could not have matched, so the tree is unchanged -- the
+    /// bench signature is the gate on that claim.
+    fn is_repetition(&self, hash: u64, halfmove: u8) -> bool {
+        let budget = halfmove as usize;
+        if budget < 2 {
+            return false; // the last move was irreversible: nothing can repeat yet
+        }
+        // `path` holds ancestors of this node, most recent last.
+        let from_path = self.path.len().min(budget);
+        if self
+            .path
+            .iter()
+            .rev()
+            .take(from_path)
+            .skip(1)
+            .step_by(2)
+            .any(|&h| h == hash)
+        {
+            return true;
+        }
+        // Whatever budget is left reaches back into the pre-search game history. Parity carries
+        // over: `path` consumed `from_path` plies, so the first game_hist entry to test is the
+        // one that keeps the two-ply stride.
+        let rem = budget.saturating_sub(from_path);
+        if rem == 0 {
+            return false;
+        }
+        let skip = if from_path % 2 == 0 { 1 } else { 0 };
+        self.game_hist
+            .iter()
+            .rev()
+            .take(rem)
+            .skip(skip)
+            .step_by(2)
+            .any(|&h| h == hash)
     }
 
     /// static eval at a node: NNUE (incremental accumulator) when a net is loaded, else PeSTO.
@@ -686,7 +816,7 @@ impl Searcher {
     #[inline]
     fn eval_node(&self, board: &Board, acc: Option<&nnue::Acc>) -> i32 {
         match acc {
-            Some(a) => nnue::forward(nnue::net().unwrap(), &a.w, &a.b, board.side_to_move()),
+            Some(a) => nnue::forward(self.net.unwrap(), &a.w, &a.b, board.side_to_move()),
             None => evaluate(board),
         }
     }
@@ -716,7 +846,18 @@ impl Searcher {
         if !CORR_HIST {
             return raw;
         }
-        raw + self.corr[Self::corr_index(board, stm)] / CORR_GRAIN
+        self.corrected_eval_at(Self::corr_index(board, stm), raw)
+    }
+
+    /// F6 (2026-09-10): the index form. `corr_index` is a two-multiply splitmix hash of both pawn
+    /// bitboards, and it was computed TWICE per node -- once here and again in `update_corr` at
+    /// the end of the same node, for the same position. Hash once, pass the index down.
+    #[inline]
+    fn corrected_eval_at(&self, ci: usize, raw: i32) -> i32 {
+        if !CORR_HIST {
+            return raw;
+        }
+        raw + self.corr[ci] / CORR_GRAIN
     }
 
     /// Fold one search result into the correction for this structure.
@@ -731,8 +872,7 @@ impl Searcher {
     ///    from bounds that never constrained anything.
     fn update_corr(
         &mut self,
-        board: &Board,
-        stm: Color,
+        corr_ci: usize,
         static_eval: i32,
         best: i32,
         bound: u8,
@@ -750,7 +890,7 @@ impl Searcher {
         let w = depth.clamp(1, CORR_W_MAX);
         let target = (best - static_eval).clamp(-CORR_MAX / CORR_GRAIN, CORR_MAX / CORR_GRAIN)
             * CORR_GRAIN;
-        let e = &mut self.corr[Self::corr_index(board, stm)];
+        let e = &mut self.corr[corr_ci];
         *e = (*e * (CORR_W - w) + target * w) / CORR_W;
         *e = (*e).clamp(-CORR_MAX, CORR_MAX);
     }
@@ -832,7 +972,7 @@ impl Searcher {
             alpha = alpha.max(best);
         }
 
-        let mut moves: Vec<(i32, Move)> = std::mem::take(&mut self.qmove_buf[ply as usize]);
+        let mut moves: Vec<(i32, Move, u8)> = std::mem::take(&mut self.qmove_buf[ply as usize]);
         moves.clear();
         // Destination mask (2026-09-09). qsearch used to walk EVERY legal move and throw away
         // the ~85% that are quiet -- and the throwing-away is not free: each rejected move costs
@@ -853,6 +993,9 @@ impl Searcher {
             t
         };
         let promo_rank = Rank::Eighth.relative_to(stm).bitboard();
+        // F4: hoisted once per node; the classifier below needs no board queries of its own.
+        let enemy = board.colors(opp(stm));
+        let ep_sq = ep_square(board, stm);
         board.generate_moves(|mut pm| {
             if !in_check {
                 let mut t = qtargets;
@@ -866,7 +1009,7 @@ impl Searcher {
             }
             let moved = pm.piece;
             for mv in pm {
-                let victim = capture_victim(board, mv);
+                let victim = capture_victim_with(board, mv, enemy, ep_sq);
                 let is_qpromo = mv.promotion == Some(Piece::Queen);
                 if in_check || victim.is_some() || is_qpromo {
                     // SEE pruning: skip losing captures entirely (not while in check)
@@ -885,7 +1028,10 @@ impl Searcher {
                             s += 90_000;
                         }
                     }
-                    moves.push((s, mv));
+                    // F4: the victim's VALUE is carried to the delta-pruning pass below, which
+                    // used to call capture_victim all over again for every move it considered.
+                    // 0 means "not a capture"; piece_val never yields 0 for a real victim.
+                    moves.push((s, mv, victim.map_or(0u8, |v| v as u8 + 1)));
                 }
             }
             false
@@ -895,21 +1041,21 @@ impl Searcher {
             self.qmove_buf[ply as usize] = moves;
             return -MATE + ply;
         }
-        moves.sort_unstable_by_key(|&(s, _)| -s);
+        moves.sort_unstable_by_key(|&(s, _, _)| -s);
 
-        for &(_, mv) in moves.iter() {
+        for &(_, mv, vtag) in moves.iter() {
             // delta pruning: even winning this victim can't lift alpha
-            if !in_check {
-                if let Some(v) = capture_victim(board, mv) {
-                    if best + piece_val(v) + 200 < alpha {
-                        continue;
-                    }
+            if !in_check && vtag != 0 {
+                // F4: victim recovered from the tag set during generation, not reclassified.
+                let v = Piece::index((vtag - 1) as usize);
+                if best + piece_val(v) + 200 < alpha {
+                    continue;
                 }
             }
             let mut nb = board.clone();
             nb.play_unchecked(mv);
             self.tt.prefetch(nb.hash());
-            let nacc = acc.map(|a| nnue::acc_update(nnue::net().unwrap(), a, board, mv));
+            let nacc = acc.map(|a| nnue::acc_update(self.net.unwrap(), a, board, mv));
             let sc = -self.qsearch(&nb, ply + 1, -beta, -alpha, nacc.as_ref());
             if self.stopped {
                 return best.max(sc);
@@ -1000,7 +1146,7 @@ impl Searcher {
         }
         let hash = board.hash();
         if ply > 0 {
-            if board.halfmove_clock() >= 100 || self.is_repetition(hash) {
+            if board.halfmove_clock() >= 100 || self.is_repetition(hash, board.halfmove_clock()) {
                 self.nodes += 1;
                 return 0;
             }
@@ -1090,7 +1236,13 @@ impl Searcher {
         // Everything downstream -- improving, reverse futility, null move, LMP -- reads the
         // CORRECTED eval. That is the point: the corrections are only worth anything if they
         // reach the pruning decisions the static eval drives.
-        let static_eval = self.corrected_eval(board, stm, raw_eval);
+        // F6: hashed once here, reused by update_corr at the end of this node.
+        let corr_ci = if CORR_HIST {
+            Self::corr_index(board, stm)
+        } else {
+            0
+        };
+        let static_eval = self.corrected_eval_at(corr_ci, raw_eval);
         self.eval_hist[ply as usize] = static_eval;
 
         // "improving": the side to move stands better than it did two plies ago, so this line is
@@ -1219,7 +1371,7 @@ impl Searcher {
                 let mut nb = board.clone();
                 nb.play_unchecked(mv);
                 self.tt.prefetch(nb.hash());
-                let nacc = acc.map(|a| nnue::acc_update(nnue::net().unwrap(), a, board, mv));
+                let nacc = acc.map(|a| nnue::acc_update(self.net.unwrap(), a, board, mv));
                 let na = nacc.as_ref();
                 let cur_ci = board.piece_on(mv.from).unwrap() as usize * 64 + mv.to as usize;
                 self.path.push(hash);
@@ -1251,12 +1403,15 @@ impl Searcher {
         // ranked by the policy logit instead of killers/countermove/history — captures,
         // promotions and the TT move keep their classical slots. act512 computed once per
         // node from the same accumulator the value head uses.
+        // F4: hoisted so the per-move classifier needs no board queries of its own.
+        let enemy = board.colors(opp(stm));
+        let ep_sq = ep_square(board, stm);
         let pol = crate::policy::policy();
         let act = match (pol, acc) {
             (Some(_), Some(a)) => Some(crate::policy::activations(a, stm)),
             _ => None,
         };
-        let mut moves: Vec<(i32, Move)> = std::mem::take(&mut self.move_buf[ply as usize]);
+        let mut moves: Vec<(i32, Move, u8)> = std::mem::take(&mut self.move_buf[ply as usize]);
         moves.clear();
         board.generate_moves(|pm| {
             // The generator already tells us which piece is moving. `board.piece_on(mv.from)`
@@ -1265,9 +1420,19 @@ impl Searcher {
             let moved = pm.piece;
             for mv in pm {
                 let packed = pack(mv);
+                let mut tg = moved as u8;
                 // NB: must read the victim through capture_victim, not piece_on(mv.to) --
                 // for en passant the destination is empty and .unwrap() would panic.
-                let victim = capture_victim(board, mv);
+                let victim = capture_victim_with(board, mv, enemy, ep_sq);
+                // CLASSIFICATION IS SET HERE, OUTSIDE THE SCORING CHAIN, and that placement is
+                // the whole correctness argument. Setting it inside the capture arm lets the
+                // TT-move arm short-circuit past it, so a TT move that IS a capture arrives in
+                // the loop tagged quiet -- counted in quiets_tried, given killer/history
+                // updates, made LMR-eligible. The bench signature caught exactly that: 271991
+                // instead of 284537.
+                if victim.is_some() {
+                    tg |= tag::CAPTURE;
+                }
                 let s = if packed == tt_mv && tt_mv != 0 {
                     1_000_000
                 } else if let Some(v) = victim {
@@ -1284,6 +1449,7 @@ impl Searcher {
                         0
                     };
                     if see(board, mv) >= 0 {
+                        tg |= tag::SEE_WIN;
                         100_000 + mvvlva + ch // winning/equal captures ahead of all but TT
                     } else {
                         -20_000 + mvvlva / 10 + ch // losing captures behind all quiets
@@ -1306,11 +1472,12 @@ impl Searcher {
                     78_000
                 } else {
                     // butterfly history + continuation history (1-ply + 2-ply predecessors)
+                    tg |= tag::IS_HIST_SCORE;
                     let ci = moved as usize * 64 + mv.to as usize;
                     self.history[stm as usize][mv.from as usize][mv.to as usize]
                         + self.cont_score(&preds, ci)
                 };
-                moves.push((s, mv));
+                moves.push((s, mv, tg));
             }
             false
         });
@@ -1319,7 +1486,7 @@ impl Searcher {
             self.move_buf[ply as usize] = moves;
             return if in_check { -MATE + ply } else { 0 };
         }
-        moves.sort_unstable_by_key(|&(s, _)| -s);
+        moves.sort_unstable_by_key(|&(s, _, _)| -s);
 
         if KILLER_CLEAR && (ply as usize) + 2 < MAX_PLY {
             self.killers[ply as usize + 2] = [0; 2];
@@ -1329,7 +1496,7 @@ impl Searcher {
         let mut best_mv: u16 = 0;
         let mut best_is_capture = false;
         let mut bound = BOUND_UPPER;
-        let mut quiets_tried: Vec<Move> = std::mem::take(&mut self.quiet_buf[ply as usize]);
+        let mut quiets_tried: Vec<(Move, usize)> = std::mem::take(&mut self.quiet_buf[ply as usize]);
         quiets_tried.clear();
         let mut caps_tried: Vec<Move> = std::mem::take(&mut self.capt_buf[ply as usize]);
         caps_tried.clear();
@@ -1339,12 +1506,15 @@ impl Searcher {
         // Doubled when improving, since a line that is going our way deserves the longer look.
         let lmp_limit = ((tune::lmp_base() + depth * depth) / if improving { 1 } else { 2 }) as usize;
 
-        for (i, &(_, mv)) in moves.iter().enumerate() {
+        for (i, &(sc, mv, tg)) in moves.iter().enumerate() {
             let packed_mv = pack(mv);
             if packed_mv == excl {
                 continue; // singular verification: this node is searched without its best move
             }
-            let is_capture = capture_victim(board, mv).is_some();
+            // F1: was `capture_victim(board, mv).is_some()` -- a full reclassify per move,
+            // including quiets the scoring closure had already proved quiet and moves about to be
+            // pruned. cozy's piece_on is a linear scan of up to six bitboards.
+            let is_capture = tag::is_capture(tg);
             let is_quiet = !is_capture && mv.promotion.is_none();
 
             // Late move pruning. Once `lmp_limit` quiets have been searched without beating
@@ -1412,13 +1582,21 @@ impl Searcher {
                 && best > -MATE_BOUND
                 && mv.promotion.is_none()
             {
-                let threshold = if is_quiet {
-                    SEE_Q_MARGIN * depth
-                } else {
-                    SEE_C_MARGIN * depth * depth
-                };
-                if see(board, mv) < threshold {
-                    continue;
+                // F2: the capture threshold is SEE_C_MARGIN * depth^2, always NEGATIVE, so a
+                // capture the scoring closure already measured at see >= 0 can NEVER be pruned
+                // here -- the call was pure waste of the most expensive function in the ordering
+                // path. The tag carries that sign. Robust where score arithmetic would not be:
+                // a TT move is searched first, where `best > -MATE_BOUND` is false and this
+                // block cannot fire at all.
+                if !(is_capture && tag::see_winning(tg)) {
+                    let threshold = if is_quiet {
+                        SEE_Q_MARGIN * depth
+                    } else {
+                        SEE_C_MARGIN * depth * depth
+                    };
+                    if see(board, mv) < threshold {
+                        continue;
+                    }
                 }
             }
 
@@ -1454,12 +1632,13 @@ impl Searcher {
             let new_depth = depth - 1 + extension;
 
             // continuation-history index of the move being played (any move, capture or quiet)
-            let cur_ci = board.piece_on(mv.from).unwrap() as usize * 64 + mv.to as usize;
+            // F1: the generator handed us the piece; the buffer now carries it.
+            let cur_ci = tag::piece(tg) * 64 + mv.to as usize;
             let mut nb = board.clone();
             nb.play_unchecked(mv);
             // Start the child's transposition line moving now. A probe is a guaranteed cache miss on a table larger than L2, and the accumulator update below needs none of it -- ~230 cycles of cover for the latency.
             self.tt.prefetch(nb.hash());
-            let nacc = acc.map(|a| nnue::acc_update(nnue::net().unwrap(), a, board, mv));
+            let nacc = acc.map(|a| nnue::acc_update(self.net.unwrap(), a, board, mv));
             let na = nacc.as_ref();
             self.path.push(hash);
             self.cont_stack.push(cur_ci);
@@ -1500,8 +1679,16 @@ impl Searcher {
                             + self.cont_score(&preds, cur_ci),
                     );
                     if HIST_LMR {
-                        let h = self.history[stm as usize][mv.from as usize][mv.to as usize]
-                            + self.cont_score(&preds, cur_ci);
+                        // F3: when the ordering score already IS history + continuation, reuse
+                        // it rather than reloading both tables. Killers and countermoves are
+                        // quiets whose score is 80_000 / 78_000, unrelated to their history, so
+                        // they must still be computed -- the tag distinguishes them.
+                        let h = if HIST_LMR_REUSE && tag::is_hist_score(tg) {
+                            sc
+                        } else {
+                            self.history[stm as usize][mv.from as usize][mv.to as usize]
+                                + self.cont_score(&preds, cur_ci)
+                        };
                         r -= (h / tune::hist_lmr_div()).clamp(-2, 2);
                         r = r.max(0);
                     }
@@ -1555,12 +1742,11 @@ impl Searcher {
                                 [mv.to as usize];
                             *h += bonus - *h * bonus / 16_384;
                             self.cont_bonus(&preds, cur_ci, bonus);
-                            for q in &quiets_tried {
+                            for &(q, qci) in &quiets_tried {
                                 let h = &mut self.history[stm as usize][q.from as usize]
                                     [q.to as usize];
                                 *h -= bonus + *h * bonus / 16_384;
-                                let qci =
-                                    board.piece_on(q.from).unwrap() as usize * 64 + q.to as usize;
+                                // F1: qci was computed when the move was tried, not re-derived
                                 self.cont_bonus(&preds, qci, -bonus);
                             }
                         }
@@ -1572,8 +1758,8 @@ impl Searcher {
                         if CAPT_HIST {
                             let bonus = hist_bonus(depth);
                             if is_capture {
-                                if let Some(v) = capture_victim(board, mv) {
-                                    let a = board.piece_on(mv.from).unwrap();
+                                if let Some(v) = capture_victim_with(board, mv, enemy, ep_sq) {
+                                    let a = Piece::index(tag::piece(tg));
                                     let e = &mut self.capt[capt_index(stm, a, mv.to, v)];
                                     *e += bonus - *e * bonus / 16_384;
                                 }
@@ -1591,7 +1777,7 @@ impl Searcher {
                 }
             }
             if is_quiet {
-                quiets_tried.push(mv);
+                quiets_tried.push((mv, cur_ci));
             } else if CAPT_HIST && is_capture {
                 caps_tried.push(mv);
             }
@@ -1604,7 +1790,7 @@ impl Searcher {
             // same exclusion, same reason: a verification score describes a different position,
             // and `in_check` is already known false here (checks went to qsearch at the top).
             if !in_check {
-                self.update_corr(board, stm, static_eval, best, bound, depth, best_is_capture);
+                self.update_corr(corr_ci, static_eval, best, bound, depth, best_is_capture);
             }
         }
         // Give the buffers back so the next node at this ply reuses the capacity. The two
@@ -1651,6 +1837,7 @@ impl Searcher {
         self.cont_stack.clear();
         self.killers = [[0; 2]; MAX_PLY];
         self.root_best = 0;
+        self.net = nnue::net();
         // Rebuilt per search: under `tune` the parameters change between games.
         self.lmr = build_lmr_table();
         // only the main thread of an SMP group bumps age -- once per `go`, not once per thread
@@ -1895,6 +2082,31 @@ fn allocate_time(t: u128, inc: u128, movestogo: Option<u32>) -> (u128, u128) {
     };
     let hard = hard.min(t.saturating_sub(50)).max(1);
     (soft.min(hard), hard)
+}
+
+/// Per-move tag carried beside the ordering score, so the search loop never re-derives what the
+/// scoring closure already knew. FREE: `(i32, Move, u8)` is 8 bytes -- exactly what `(i32, Move)`
+/// already occupied, since the old tuple wasted a byte to padding.
+///
+///   bits 0..2  the moving piece, `Piece as u8`
+///   bit 3      capture (including en passant)
+///   bit 4      `see(board, mv) >= 0`; meaningful only for captures
+mod tag {
+    pub const CAPTURE: u8 = 1 << 3;
+    pub const SEE_WIN: u8 = 1 << 4;
+    /// The ordering score for this move IS `history + cont_score`, so HIST_LMR can reuse it.
+    /// NOT merely "is a quiet": killers score 80_000 and countermoves 78_000, and a quiet that
+    /// took one of those arms has a score unrelated to its history. Reusing `s` for those would
+    /// drive the LMR adjustment straight to its clamp.
+    pub const IS_HIST_SCORE: u8 = 1 << 5;
+    #[inline]
+    pub fn piece(t: u8) -> usize { (t & 7) as usize }
+    #[inline]
+    pub fn is_capture(t: u8) -> bool { t & CAPTURE != 0 }
+    #[inline]
+    pub fn see_winning(t: u8) -> bool { t & SEE_WIN != 0 }
+    #[inline]
+    pub fn is_hist_score(t: u8) -> bool { t & IS_HIST_SCORE != 0 }
 }
 
 fn has_non_pawn(board: &Board, c: Color) -> bool {
