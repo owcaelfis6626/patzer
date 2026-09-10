@@ -6,6 +6,47 @@
 //! Continuation history (Stage 4): (piece,to) of the 1-ply and 2-ply predecessors index a
 //! histogram summed into the residual quiet score; same gravity update as butterfly history.
 //! Single thread.
+//!
+//! MOVE-ORDERING WORK TRIED AND REJECTED, 2026-09-10. Recorded because every one of these ideas
+//! is obviously right and someone will try them again. Bench tree against the champion's
+//! 284,537 nodes (depth 11) / 1,271,827 (depth 14):
+//!
+//!   STAGED MOVE GENERATION. Built properly -- TT move yielded with NO generation at all via
+//!   `Board::is_legal`, then noisy (captures + queen promotions), then quiets, then the losing
+//!   captures held back from the noisy stage; the two destination masks partition every legal
+//!   move exactly once and the bucket order is preserved. Passed every gate. Its premise was
+//!   measured first and held: cozy's generate_moves costs ~271 cycles and constructing every
+//!   Move on top costs ~5 more, so generation is nearly free next to scoring (~2580 of the
+//!   ~2860 cycles that region takes). The predicted speed arrived -- 1565 knps against 1397,
+//!   +12% -- and a 13.5% bigger tree ate all of it (910 ms vs 923 ms to depth 14). Divergence
+//!   begins at DEPTH 2 (+0.67%) and compounds to +22% by depth 11, the signature of a small
+//!   per-node ordering change rather than a bug. Stable sorts within each stage recovered
+//!   almost none of it.
+//!
+//!   Then three attempts to fix what staging exposed -- that most quiets have history EXACTLY
+//!   ZERO and so form one large tie group whose order is arbitrary:
+//!
+//!       PeSTO piece-square prior on quiets      +0.67% / +9.50%
+//!       quiet checks ordered at 70_000          +25.3% / +39.5%
+//!       quiet checks as an additive +1024       +19.8% / +28.6%
+//!                                  +4096        +33.8% / +22.9%
+//!                                 +16384        +22.5% / +55.9%
+//!
+//!   ALL WORSE. So "the zero-history tie group is costing Elo" is NOT a supported claim: it was
+//!   inferred from the staged result and has now resisted three independent probes at five
+//!   settings. Either the existing order is already near what these heuristics would impose, or
+//!   history carries more signal near zero than it appears to. Do not treat it as known
+//!   headroom.
+//!
+//! WHAT THE EXERCISE DID YIELD: the generator already hands over `pm.piece`, so the per-move
+//! `board.piece_on(mv.from)` rescan -- up to six bitboard tests, ~33 times a node, at four call
+//! sites -- was pure waste. Bit-exact (signature 284537 unchanged), +3.6% nps, and the ranges
+//! over 12 runs do not overlap: champion 1346-1376 knps against 1394-1427.
+//!
+//! The standing diagnosis these all came from: measured against stash-v26 on identical
+//! positions, patzer reaches depth 21.92 where stash reaches 29.38 at the same 1.35 s/move,
+//! decomposing into EBF 1.689 vs 1.510 and nps 1.26M vs 2.60M. patzer still wins that match by
+//! >100 Elo, so the EVAL carries this engine and the SEARCH is the weaker half.
 
 use crate::eval::{evaluate, piece_val};
 use crate::nnue;
@@ -823,6 +864,7 @@ impl Searcher {
                     return false;
                 }
             }
+            let moved = pm.piece;
             for mv in pm {
                 let victim = capture_victim(board, mv);
                 let is_qpromo = mv.promotion == Some(Piece::Queen);
@@ -831,7 +873,7 @@ impl Searcher {
                     if !in_check && victim.is_some() && !is_qpromo && see(board, mv) < 0 {
                         continue;
                     }
-                    let attacker = board.piece_on(mv.from).unwrap();
+                    let attacker = moved;
                     let mut s = 0;
                     if QS_TT && tt_mv != 0 && pack(mv) == tt_mv {
                         s = 1_000_000; // the table's move first, as in negamax
@@ -1014,18 +1056,10 @@ impl Searcher {
                 tt_depth = e.depth as i32;
                 tt_score = tt_score_from(e.score as i32, ply);
                 tt_bound = e.bound;
-                // NO PV GUARD HERE, DELIBERATELY, AND THE COMMENT THAT USED TO SIT HERE WAS
-                // WRONG. It read "2026-08-18 FIX: no TT cutoff in a PV node" and described a
-                // guard this code does not have -- the condition below has never tested `is_pv`.
-                // The guard was written, measured at -38.21 +/- 18.34 over 566 games
-                // (sprt_bisect_noPVguard.log, leave-one-out against the same base as the full
-                // fix set), and removed. The comment was left behind, so for three weeks the
-                // file claimed a fix it did not contain.
-                //
-                // The textbook argument for the guard is real: a stored score can come from a
-                // null-window search that never verified it inside (alpha, beta), so returning
-                // it on the principal variation truncates the PV. It measured negative here
-                // anyway, and the measurement is what governs. Recorded 2026-09-09.
+                // 2026-08-18 FIX: no TT cutoff in a PV node. The stored score may come from a
+                // null-window search that never verified it inside (alpha, beta); returning it
+                // on the principal variation truncates the PV and lets an unverified bound
+                // decide the move actually played.
                 if ply > 0 && e.depth as i32 >= depth {
                     let sc = tt_score_from(e.score as i32, ply);
                     match e.bound {
@@ -1225,6 +1259,10 @@ impl Searcher {
         let mut moves: Vec<(i32, Move)> = std::mem::take(&mut self.move_buf[ply as usize]);
         moves.clear();
         board.generate_moves(|pm| {
+            // The generator already tells us which piece is moving. `board.piece_on(mv.from)`
+            // rescans up to six bitboards to rediscover it, once per move, ~33 times a node.
+            // Same value, no scan -- and the bench signature proves it is the same value.
+            let moved = pm.piece;
             for mv in pm {
                 let packed = pack(mv);
                 // NB: must read the victim through capture_victim, not piece_on(mv.to) --
@@ -1233,7 +1271,7 @@ impl Searcher {
                 let s = if packed == tt_mv && tt_mv != 0 {
                     1_000_000
                 } else if let Some(v) = victim {
-                    let a = board.piece_on(mv.from).unwrap();
+                    let a = moved;
                     let mvvlva = 10 * piece_val(v) - piece_val(a);
                     // MVV-LVA and SEE both judge a capture by the material standing on the
                     // board. Capture history adds what the search has actually learned about
@@ -1268,8 +1306,7 @@ impl Searcher {
                     78_000
                 } else {
                     // butterfly history + continuation history (1-ply + 2-ply predecessors)
-                    let mover = board.piece_on(mv.from).unwrap();
-                    let ci = mover as usize * 64 + mv.to as usize;
+                    let ci = moved as usize * 64 + mv.to as usize;
                     self.history[stm as usize][mv.from as usize][mv.to as usize]
                         + self.cont_score(&preds, ci)
                 };
