@@ -7,7 +7,7 @@
 //! Forward: acc(i16, clamp 0..127) -> l1 i32 -> clamp 0..8128 -> /64 (0..127) -> l2 i32 = v2;
 //! cp = v2 * 400 / 8128, truncated toward zero (Rust i32 division semantics).
 
-use cozy_chess::{Board, Color, Move};
+use cozy_chess::{Board, Color, Move, Piece};
 use std::sync::OnceLock;
 
 pub const ACC: usize = 256;
@@ -324,10 +324,37 @@ fn row_sub(acc: &mut Acc, net: &Network, color: Color, piece: usize, sq: usize) 
 
 /// accumulator after `mv` is played on `board` (board must be the pre-move position)
 pub fn acc_update(net: &Network, acc: &Acc, board: &Board, mv: Move) -> Acc {
+    use cozy_chess::Square;
+    let moving = board.piece_on(mv.from).expect("no piece on from");
+    // Cold callers (nnueinc, datagen) do not carry the victim; resolve it here. The search
+    // passes it in, which is what removes this `piece_on` scan from the per-make path.
+    let victim = match board.piece_on(mv.to) {
+        Some(v) => Some((v, mv.to)),
+        None if moving == Piece::Pawn && mv.from.file() != mv.to.file() => {
+            Some((Piece::Pawn, Square::new(mv.to.file(), mv.from.rank())))
+        }
+        None => None,
+    };
+    acc_update_known(net, acc, board, mv, moving, victim)
+}
+
+/// As `acc_update`, but told which piece is moving and what it captures.
+///
+/// `victim` is the captured piece and the square it stood on -- for en passant that is
+/// `(to.file, from.rank)`, NOT `mv.to`. Passing it in removes the `board.piece_on(mv.to)` scan
+/// (up to six bitboard tests) that used to run on every make.
+pub fn acc_update_known(
+    net: &Network,
+    acc: &Acc,
+    board: &Board,
+    mv: Move,
+    moving: Piece,
+    victim: Option<(Piece, cozy_chess::Square)>,
+) -> Acc {
     if net.is_halfkp() {
         acc_update_hkp(net, acc, board, mv)
     } else {
-        acc_update_basic(net, acc, board, mv)
+        acc_update_basic(net, acc, board, mv, moving, victim)
     }
 }
 
@@ -416,7 +443,14 @@ fn acc_update_hkp(net: &Network, acc: &Acc, board: &Board, mv: Move) -> Acc {
     a
 }
 
-fn acc_update_basic(net: &Network, acc: &Acc, board: &Board, mv: Move) -> Acc {
+fn acc_update_basic(
+    net: &Network,
+    acc: &Acc,
+    board: &Board,
+    mv: Move,
+    moving: Piece,
+    victim: Option<(Piece, cozy_chess::Square)>,
+) -> Acc {
     use cozy_chess::{File, Piece, Square};
     let mut a = acc.clone();
     let stm = board.side_to_move();
@@ -424,7 +458,7 @@ fn acc_update_basic(net: &Network, acc: &Acc, board: &Board, mv: Move) -> Acc {
         Color::White => Color::Black,
         Color::Black => Color::White,
     };
-    let moving = board.piece_on(mv.from).expect("no piece on from") as usize;
+    let moving = moving as usize;
 
     if board.color_on(mv.to) == Some(stm) {
         // castling (cozy: king takes own rook)
@@ -440,12 +474,8 @@ fn acc_update_basic(net: &Network, acc: &Acc, board: &Board, mv: Move) -> Acc {
         row_add(&mut a, net, stm, Piece::Rook as usize, Square::new(rf, back) as usize);
     } else {
         row_sub(&mut a, net, stm, moving, mv.from as usize);
-        if let Some(victim) = board.piece_on(mv.to) {
-            row_sub(&mut a, net, them, victim as usize, mv.to as usize);
-        } else if moving == Piece::Pawn as usize && mv.from.file() != mv.to.file() {
-            // en passant: captured pawn sits on (to.file, from.rank)
-            let vsq = Square::new(mv.to.file(), mv.from.rank());
-            row_sub(&mut a, net, them, Piece::Pawn as usize, vsq as usize);
+        if let Some((v, vsq)) = victim {
+            row_sub(&mut a, net, them, v as usize, vsq as usize);
         }
         let placed = mv.promotion.map(|p| p as usize).unwrap_or(moving);
         row_add(&mut a, net, stm, placed, mv.to as usize);

@@ -236,7 +236,24 @@ pub fn uci_loop() {
                         if is_main {
                             match best {
                                 Some(mv) => println!("bestmove {}", display_uci_move(&board, mv)),
-                                None => println!("bestmove 0000"),
+                                None => {
+                                    // 2026-09-11 (readiness audit R3): `go depth 0` on the START
+                                    // POSITION emitted `bestmove 0000` with 20 legal moves on the
+                                    // board -- measured. A stop landing before depth 1 completes
+                                    // takes the same path. Some GUIs score that as a forfeit, so
+                                    // fall back to a legal move; 0000 only when there is none.
+                                    let mut fallback = None;
+                                    board.generate_moves(|pm| {
+                                        fallback = pm.into_iter().next();
+                                        true
+                                    });
+                                    match fallback {
+                                        Some(mv) => {
+                                            println!("bestmove {}", display_uci_move(&board, mv))
+                                        }
+                                        None => println!("bestmove 0000"),
+                                    }
+                                }
                             }
                         }
                     }));

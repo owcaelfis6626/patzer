@@ -453,8 +453,10 @@ fn run_datagen(
                         }
 
                         // record filter: quiet, undecided, past the random opening
-                        let is_capture = board.color_on(mv.to).is_some()
-                            && board.color_on(mv.to) != Some(stm);
+                        // NOT a hand-rolled color_on(mv.to) test: that predicate is FALSE for
+                        // en passant (the destination square is empty), so ep captures were
+                        // recorded as "quiet" positions. Same bug the search fixed 2026-08-18.
+                        let is_capture = crate::search::capture_victim(&board, mv).is_some();
                         let in_check = !board.checkers().is_empty();
                         if ply >= SKIP_PLIES
                             && !in_check

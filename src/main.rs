@@ -76,6 +76,26 @@ fn main() {
                 a.get(5).and_then(|n| n.parse().ok()).unwrap_or(0),
             );
         }
+        Some("fendump") => {
+            // fendump <in.bin> [limit]  -- stream "idx<TAB>score<TAB>fen" per record so an
+            // external labeller never re-implements the 32-byte format in another language.
+            // The record is pack_board()'s 27 bytes + score i16 + wdl u8 + best u16.
+            let a: Vec<String> = std::env::args().collect();
+            let path = a.get(2).expect("usage: fendump <in.bin> [limit]");
+            let limit = a.get(3).and_then(|n| n.parse::<usize>().ok()).unwrap_or(usize::MAX);
+            let raw = std::fs::read(path).expect("read in.bin");
+            assert!(raw.len() % 32 == 0, "{path}: size not a multiple of 32");
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut w = std::io::BufWriter::new(stdout.lock());
+            for (i, rec) in raw.chunks_exact(32).take(limit).enumerate() {
+                let mut buf = [0u8; 27];
+                buf.copy_from_slice(&rec[..27]);
+                let score = i16::from_le_bytes([rec[27], rec[28]]);
+                writeln!(w, "{i}\t{score}\t{}", datagen::unpack_to_fen(&buf))
+                    .expect("write fendump");
+            }
+        }
         Some("nnueevalbin") => {
             // nnueevalbin <in.bin> <out.i16> <net.nnue> [limit]
             let a: Vec<String> = std::env::args().collect();
@@ -251,10 +271,13 @@ fn book_gate() {
 /// in another engine. See search::instrument.
 #[cfg(feature = "instrument")]
 fn histdump(depth: i32) {
-    println!("HISTDUMP — history scale over the bench suite at depth {depth}");
+    // second arg = hash MB, so the ordering instrument can be run across table sizes: 31.5% of
+    // fail-high cutoffs come from the TT move, and at 40/15 a 64 MB table turns over 7.24x.
+    let hash: usize = std::env::args().nth(3).and_then(|n| n.parse().ok()).unwrap_or(64);
+    println!("HISTDUMP — history scale over the bench suite at depth {depth}, hash {hash} MB");
     for (_, fen, _) in PERFT_SUITE {
         let board = Board::from_fen(fen, false).expect("bad FEN");
-        let mut s = Searcher::new(64);
+        let mut s = Searcher::new(hash);
         s.silent = true;
         s.think(&board, &Limits { depth: Some(depth), ..Default::default() });
     }
