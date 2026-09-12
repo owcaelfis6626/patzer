@@ -88,8 +88,8 @@ const SE_MIN_DEPTH: i32 = 0;
 // SE_MIN_DEPTH, which is 0, so the champion tree is untouched until an SPRT turns it on.
 // MARGINS ARE SF-SHAPED AND ARE THE THING TO RE-TUNE once enabled.
 const SE_MARGIN: i32 = 60;         // singularBeta = tt_score - SE_MARGIN*depth/60
-const SE_DOUBLE: bool = true;      // 2nd ply when value < singularBeta - 4*depth/60
-const SE_TRIPLE: bool = true;      // 3rd ply when value < singularBeta - 73*depth/60
+const SE_DOUBLE: bool = false;     // margins unvalidated: see report
+const SE_TRIPLE: bool = false;     // margins unvalidated: see report
 const SE_DOUBLE_MARGIN: i32 = 4;
 const SE_TRIPLE_MARGIN: i32 = 73;
 const SE_MULTICUT: bool = true;    // several moves fail high -> the node is not singular
