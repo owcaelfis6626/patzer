@@ -80,6 +80,20 @@ const IIR_MIN_DEPTH: i32 = 4; // 0 disables internal iterative reduction
 // Powered to ~+-13 Elo; a smaller real effect is not excluded. See campaign.jsonl
 // "se_paired_external".
 const SE_MIN_DEPTH: i32 = 0;
+// Singular-extension FAMILY, 2026-09-12. The old code returned at most +1. Modern engines
+// (SF 18, Reckless, PlentyChess, Alexandria) instead: scale the singular margin with depth,
+// add a 2nd/3rd ply when the excluded search fails even lower (double/triple extension),
+// prune the whole subtree when several moves fail high (multi-cut), and REDUCE the TT move
+// when the evidence says it is not singular (negative extension). All of it is gated by
+// SE_MIN_DEPTH, which is 0, so the champion tree is untouched until an SPRT turns it on.
+// MARGINS ARE SF-SHAPED AND ARE THE THING TO RE-TUNE once enabled.
+const SE_MARGIN: i32 = 60;         // singularBeta = tt_score - SE_MARGIN*depth/60
+const SE_DOUBLE: bool = true;      // 2nd ply when value < singularBeta - 4*depth/60
+const SE_TRIPLE: bool = true;      // 3rd ply when value < singularBeta - 73*depth/60
+const SE_DOUBLE_MARGIN: i32 = 4;
+const SE_TRIPLE_MARGIN: i32 = 73;
+const SE_MULTICUT: bool = true;    // several moves fail high -> the node is not singular
+const SE_NEGATIVE: bool = true;    // reduce the TT move when it is not singular
 const LMR_TWEAKS: bool = true; // PV/improving adjustments to the LMR reduction
 
 // ---- 2026-09-09 search batch. Each gate is independent so a failed SPRT can be bisected
@@ -733,6 +747,11 @@ pub struct Limits {
     /// control. `None` means sudden death or increment-only.
     pub movestogo: Option<u32>,
     pub infinite: bool,
+    /// Milliseconds reserved per move for GUI/network latency, subtracted from the clock before
+    /// the budget is computed (UCI `Move Overhead`).
+    pub move_overhead: u128,
+    /// Experimental soft-budget adjustment from completed root iterations.
+    pub adaptive_time: bool,
 }
 
 pub struct Searcher {
@@ -740,6 +759,9 @@ pub struct Searcher {
     // true for exactly one thread per `go` (the one that prints `info`/returns bestmove and
     // bumps the TT age once); SMP helper threads share the same tt+stop but are not main.
     is_main: bool,
+    /// Which thread this is in the SMP group. Used only for Lazy SMP search diversity; thread
+    /// 0 (main, and every single-threaded caller) starts at depth 1, so Threads=1 is identical.
+    pub thread_id: usize,
     killers: [[u16; 2]; MAX_PLY],
     // i16, not i32, 2026-09-11. These three tables are the hottest RANDOM-access data in the
     // engine -- `cont` alone is 1152 KB live against a 256 KB L2, so every continuation lookup is
@@ -831,6 +853,7 @@ impl Searcher {
         Searcher {
             tt,
             is_main,
+            thread_id: 0,
             killers: [[0; 2]; MAX_PLY],
             history: [[[0i16; 64]; 64]; 2],
             counter: [[[0; 64]; 64]; 2],
@@ -1207,6 +1230,7 @@ impl Searcher {
             });
             let sc = -self.qsearch(&nb, ply + 1, -beta, -alpha, nacc.as_ref());
             if self.stopped {
+                self.qmove_buf[ply as usize] = moves;
                 return best.max(sc);
             }
             if sc > best {
@@ -1781,16 +1805,40 @@ impl Searcher {
                 && tt_bound != BOUND_UPPER
                 && tt_score.abs() < MATE_BOUND
             {
-                let s_beta = tt_score - 3 * depth;
+                let s_beta = tt_score - (SE_MARGIN * depth) / 60;
                 let s_depth = (depth - 1) / 2;
                 self.excluded[ply as usize] = tt_mv;
                 let s = self.negamax(board, s_depth, ply, s_beta - 1, s_beta, prev, acc, cut_node);
                 self.excluded[ply as usize] = 0;
                 if self.stopped {
+                    self.move_buf[ply as usize] = moves;
+                    self.quiet_buf[ply as usize] = quiets_tried;
+                    self.capt_buf[ply as usize] = caps_tried;
                     return 0; // no move searched yet at this point, so nothing to preserve
                 }
                 if s < s_beta {
+                    // Singular. Scale the extension by how far below the margin the excluded
+                    // search fell: one ply, plus a second/third when it is far enough below.
                     extension = 1;
+                    if SE_DOUBLE && s < s_beta - (SE_DOUBLE_MARGIN * depth) / 60 {
+                        extension += 1;
+                    }
+                    if SE_TRIPLE && s < s_beta - (SE_TRIPLE_MARGIN * depth) / 60 {
+                        extension += 1;
+                    }
+                } else if SE_MULTICUT && s >= beta && tt_score.abs() < MATE_BOUND {
+                    // Multi-cut: the TT move was assumed to fail high, but other moves fail high
+                    // over beta without it, so this expected cut node is not singular. Cut the
+                    // whole subtree with a soft bound instead of searching it.
+                    self.move_buf[ply as usize] = moves;
+                    self.quiet_buf[ply as usize] = quiets_tried;
+                    self.capt_buf[ply as usize] = caps_tried;
+                    return s;
+                } else if SE_NEGATIVE {
+                    // Not singular and not a multi-cut. If the TT move is assumed to fail high
+                    // over beta, reduce it hard; on a cut node reduce it a little. This is the
+                    // "the stored move is not as good as the table thinks" signal.
+                    extension = if tt_score >= beta { -3 } else if cut_node { -2 } else { 0 };
                 }
             }
             let new_depth = depth - 1 + extension;
@@ -1887,6 +1935,9 @@ impl Searcher {
             self.cont_stack.pop();
             self.path.pop();
             if self.stopped {
+                self.move_buf[ply as usize] = moves;
+                self.quiet_buf[ply as usize] = quiets_tried;
+                self.capt_buf[ply as usize] = caps_tried;
                 return best.max(sc);
             }
 
@@ -1976,9 +2027,7 @@ impl Searcher {
                 self.update_corr(corr_ci, static_eval, best, bound, depth, best_is_capture);
             }
         }
-        // Give the buffers back so the next node at this ply reuses the capacity. The two
-        // `self.stopped` early returns deliberately skip this: the search is ending, and
-        // moving `moves` out is impossible there anyway while it is being iterated.
+        // Give the buffers back for reuse, including across successive go commands.
         self.move_buf[ply as usize] = moves;
         self.quiet_buf[ply as usize] = quiets_tried;
         self.capt_buf[ply as usize] = caps_tried;
@@ -2006,15 +2055,8 @@ impl Searcher {
     pub fn think(&mut self, board: &Board, limits: &Limits) -> Option<Move> {
         self.nodes = 0;
         self.stopped = false;
-        // 2026-08-18 FIX: only the main thread clears the SHARED stop flag. Every thread used to
-        // do it, and thread spawning is staggered, so a `stop` arriving between spawns was
-        // cleared by whichever helper entered think() next -- un-stopping the group after the
-        // bestmove had already been printed, and leaving the next `go` blocked in join() until
-        // the runaways hit their own hard limit. uci.rs already resets once before any spawn;
-        // this keeps the non-UCI callers (datagen) working without racing the UCI thread.
-        if self.is_main {
-            self.stop.store(false, Ordering::Relaxed);
-        }
+        // The caller resets the shared stop flag BEFORE launching workers. Clearing it here
+        // would lose a stop/quit delivered between thread creation and search startup.
         self.start = Instant::now();
         self.path.clear();
         self.cont_stack.clear();
@@ -2038,7 +2080,9 @@ impl Searcher {
                 Color::Black => (limits.btime, limits.binc.unwrap_or(0)),
             };
             match t {
-                Some(t) => allocate_time(t, inc, limits.movestogo),
+                Some(t) => {
+                    allocate_time(t.saturating_sub(limits.move_overhead), inc, limits.movestogo)
+                }
                 None => (u128::MAX, u128::MAX),
             }
         };
@@ -2068,8 +2112,20 @@ impl Searcher {
 
         let mut best: Option<Move> = None;
         let mut prev_score = 0i32;
+        let mut previous_best = None;
+        let mut stable_iterations = 0u32;
+        let adaptive = limits.adaptive_time && !limits.infinite
+            && limits.movetime.is_none() && limits.nodes.is_none() && limits.depth.is_none()
+            && match board.side_to_move() {
+                Color::White => limits.wtime.is_some(),
+                Color::Black => limits.btime.is_some(),
+            };
 
-        for depth in 1..=max_depth {
+        // Lazy SMP diversity: each helper starts its iterative deepening at a different depth,
+        // so the threads explore different trees instead of running identical work. Thread 0
+        // (main, and every single-threaded caller) starts at 1, so Threads=1 is byte-identical.
+        let depth0 = 1 + (self.thread_id % 3) as i32;
+        for depth in depth0..=max_depth {
             self.seldepth = 0;
             self.root_depth = depth;
             // aspiration windows after depth 5
@@ -2108,6 +2164,13 @@ impl Searcher {
             if self.stopped {
                 break;
             }
+            if adaptive && depth >= 5 {
+                let changed = previous_best.is_some() && previous_best != best;
+                stable_iterations = if changed { 0 } else { stable_iterations + 1 };
+                self.soft_ms = adaptive_soft_time(soft, hard, stable_iterations, changed,
+                                                  prev_score.saturating_sub(score));
+            }
+            previous_best = best;
             prev_score = score;
             self.last_score = score;
 
@@ -2209,6 +2272,42 @@ fn hist_bonus(depth: i32) -> i32 {
 #[inline]
 const fn cont_blocks() -> usize {
     if CONT_EXTRA { CONT_BLOCKS } else { 2 }
+}
+
+fn adaptive_soft_time(base: u128, hard: u128, stable: u32, changed: bool, drop_cp: i32) -> u128 {
+    // Conservative first experiment in Patzer's score units. Recompute from the
+    // original budget, never compound multipliers across depths or extend hard time.
+    let stability = if changed { 120 } else if stable >= 3 { 75 } else { 100 };
+    let falling = drop_cp.clamp(0, 100) as u128 * 30 / 100;
+    (base.saturating_mul(stability + falling) / 100).max(1).min(hard)
+}
+
+#[cfg(test)]
+mod adaptive_time_tests {
+    use super::*;
+
+    #[test]
+    fn stable_moves_save_time_and_deterioration_spends_it() {
+        assert!(adaptive_soft_time(1000, 3000, 4, false, 0) < 1000);
+        assert!(adaptive_soft_time(1000, 3000, 0, true, 80) > 1000);
+        assert_eq!(adaptive_soft_time(1000, 3000, 0, false, -500), 1000);
+    }
+
+    #[test]
+    fn a_full_block_retains_its_hard_reserve() {
+        for stressed in [false, true] {
+            let mut remaining = 900_000u128;
+            for moves in (1..=40).rev() {
+                let (base, hard) = allocate_time(remaining, 0, Some(moves));
+                let soft = adaptive_soft_time(base, hard, if stressed { 0 } else { 4 },
+                                               stressed, if stressed { 100 } else { 0 });
+                assert!(soft > 0 && soft <= hard && hard < remaining);
+                let spend = (soft * 14 / 10).min(hard);
+                remaining -= spend;
+                assert!(remaining > 0);
+            }
+        }
+    }
 }
 
 /// (soft, hard) time budget in ms for one move.
@@ -2335,6 +2434,30 @@ fn tt_score_from(s: i32, ply: i32) -> i32 {
 #[cfg(test)]
 mod ep_tests {
     use super::*;
+
+    #[test]
+    fn search_start_preserves_a_pending_stop() {
+        let mut s = Searcher::new(1);
+        s.silent = true;
+        s.stop.store(true, Ordering::Relaxed);
+        assert!(s.think(&Board::startpos(), &Limits::default()).is_none());
+        assert_eq!(s.nodes, 0);
+        assert!(s.stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn interrupted_search_preserves_scratch_capacity_for_next_move() {
+        let mut s = Searcher::new(1);
+        s.silent = true;
+        for _ in 0..2 {
+            s.think(&Board::startpos(), &Limits { nodes: Some(2048), ..Default::default() });
+            assert!(s.stopped);
+            assert!(s.move_buf.iter().all(|v| v.capacity() >= 64));
+            assert!(s.qmove_buf.iter().all(|v| v.capacity() >= 32));
+            assert!(s.quiet_buf.iter().all(|v| v.capacity() >= 64));
+            assert!(s.capt_buf.iter().all(|v| v.capacity() >= 32));
+        }
+    }
 
     fn find(board: &Board, uci: &str) -> Move {
         let mut found = None;

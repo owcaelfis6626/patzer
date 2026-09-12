@@ -17,6 +17,7 @@ fn build_pool(hash_mb: usize, n: usize, stop: &Arc<AtomicBool>) -> (Arc<TT>, Vec
     let pool = (0..n.max(1))
         .map(|i| {
             let mut s = Searcher::for_thread(tt.clone(), stop.clone(), i == 0);
+            s.thread_id = i;
             s.silent = i != 0;
             Arc::new(Mutex::new(s))
         })
@@ -41,6 +42,8 @@ pub fn uci_loop() {
     // repertoire is at best redundant and at worst steers into a line the book stops in but the
     // search has never had to hold. Still available on request; just no longer the default.
     let mut own_book = false;
+    let mut adaptive_time = false;
+    let mut move_overhead: u128 = 10;
     let mut book_seed: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -62,6 +65,8 @@ pub fn uci_loop() {
                 println!("option name Hash type spin default 64 min 1 max 4096");
                 println!("option name Threads type spin default 1 min 1 max 256");
                 println!("option name OwnBook type check default false");
+                println!("option name AdaptiveTime type check default false");
+                println!("option name Move Overhead type spin default 10 min 0 max 5000");
                 println!("option name EvalFile type string default <empty>");
                 println!("option name PolicyFile type string default <empty>");
                 #[cfg(feature = "tune")]
@@ -98,6 +103,19 @@ pub fn uci_loop() {
                     {
                         own_book = tokens.get(vi + 1).map(|v| v.eq_ignore_ascii_case("true"))
                             == Some(true);
+                    } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("adaptivetime"))
+                        == Some(true)
+                    {
+                        adaptive_time = tokens.get(vi + 1).map(|v| v.eq_ignore_ascii_case("true"))
+                            == Some(true);
+                    } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("move")) == Some(true)
+                        && tokens.get(ni + 2).map(|s| s.eq_ignore_ascii_case("overhead"))
+                            == Some(true)
+                    {
+                        // "Move Overhead" has a space, so it is two tokens after `name`.
+                        if let Some(v) = tokens.get(vi + 1).and_then(|v| v.parse::<u128>().ok()) {
+                            move_overhead = v.min(5000);
+                        }
                     } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("evalfile"))
                         == Some(true)
                     {
@@ -181,6 +199,8 @@ pub fn uci_loop() {
                     }
                 }
                 let mut limits = Limits::default();
+                limits.adaptive_time = adaptive_time;
+                limits.move_overhead = move_overhead;
                 let mut it = tokens[1..].iter();
                 while let Some(&tok) = it.next() {
                     let num =

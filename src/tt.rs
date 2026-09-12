@@ -59,13 +59,14 @@ struct Slot {
     data: AtomicU64,
 }
 
-/// Slots per cluster. 4 x 16 B = 64 B = exactly one cache line, so a probe that scans the whole
-/// cluster costs the SAME single cache miss as the old one-slot-per-index scheme -- the extra
-/// three candidates are free once the line has arrived.
+/// Four slots occupy one cache line; Cluster also guarantees its starting alignment.
 const CLUSTER: usize = 4;
 
+#[repr(align(64))]
+struct Cluster([Slot; CLUSTER]);
+
 pub struct TT {
-    slots: Vec<Slot>,
+    clusters: Vec<Cluster>,
     n_slots: usize,
     mask: usize, // over CLUSTERS, not slots
     age: AtomicU8,
@@ -82,13 +83,13 @@ impl TT {
         // budget the GUI set.
         let n = ((mb.max(1) << 20) / std::mem::size_of::<Slot>()).max(1);
         let n = (1usize << n.ilog2()).max(CLUSTER * 4);
-        let mut slots = Vec::with_capacity(n);
-        slots.resize_with(n, || Slot {
+        let mut clusters = Vec::with_capacity(n / CLUSTER);
+        clusters.resize_with(n / CLUSTER, || Cluster(std::array::from_fn(|_| Slot {
             key_xor_data: AtomicU64::new(0),
             data: AtomicU64::new(0),
-        });
+        })));
         TT {
-            slots,
+            clusters,
             n_slots: n,
             mask: (n / CLUSTER) - 1,
             age: AtomicU8::new(0),
@@ -107,8 +108,7 @@ impl TT {
 
     #[inline]
     fn cluster(&self, key: u64) -> &[Slot] {
-        let base = ((key as usize) & self.mask) * CLUSTER;
-        &self.slots[base..base + CLUSTER]
+        &self.clusters[(key as usize) & self.mask].0
     }
 
     /// Pull the cluster's cache line in before the caller needs it. A TT probe is a guaranteed
@@ -118,9 +118,9 @@ impl TT {
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let base = ((key as usize) & self.mask) * CLUSTER;
+            let base = (key as usize) & self.mask;
             std::arch::x86_64::_mm_prefetch(
-                self.slots.as_ptr().add(base) as *const i8,
+                self.clusters.as_ptr().add(base) as *const i8,
                 std::arch::x86_64::_MM_HINT_T0,
             );
         }
@@ -129,7 +129,7 @@ impl TT {
     }
 
     pub fn clear(&self) {
-        for s in &self.slots {
+        for s in self.clusters.iter().flat_map(|c| &c.0) {
             s.key_xor_data.store(0, Ordering::Relaxed);
             s.data.store(0, Ordering::Relaxed);
         }
@@ -259,7 +259,13 @@ mod tests {
     /// single miss as one did.
     #[test]
     fn a_cluster_is_one_cache_line() {
-        assert_eq!(CLUSTER * std::mem::size_of::<Slot>(), 64);
+        assert_eq!(std::mem::size_of::<Cluster>(), 64);
+        assert_eq!(std::mem::align_of::<Cluster>(), 64);
+        let tt = TT::new(1);
+        assert_eq!(tt.clusters.len() * std::mem::size_of::<Cluster>(), 1 << 20);
+        for cluster in &tt.clusters {
+            assert_eq!(cluster.0.as_ptr() as usize % 64, 0);
+        }
     }
 
     /// THE POINT OF THE 2026-09-09 CLUSTER CHANGE. Under the old single-slot policy a deep

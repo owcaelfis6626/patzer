@@ -15,6 +15,35 @@ const HIDDEN: usize = 16;
 const FT_Q: i32 = 127;
 const W_Q: i32 = 64;
 const K_CP: i32 = 400;
+const PAIR_INPUTS: usize = 768 + 1488;
+
+const fn pair_lookup() -> [[u16; 96]; 96] {
+    let mut table = [[0; 96]; 96];
+    let mut index = 768;
+    let mut a = 0usize;
+    while a < 96 {
+        let mut b = a + 1;
+        while b < 96 {
+            if a % 48 != b % 48 && (a % 8).abs_diff(b % 8) <= 1 {
+                table[a][b] = index;
+                table[b][a] = index;
+                index += 1;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    assert!(index as usize == PAIR_INPUTS);
+    table
+}
+static PAIR_LOOKUP: [[u16; 96]; 96] = pair_lookup();
+
+fn pair_feature(persp: Color, c1: Color, s1: usize, c2: Color, s2: usize) -> usize {
+    let flip = if persp == Color::Black { 56 } else { 0 };
+    let a = (c1 as usize ^ persp as usize) * 48 + (s1 ^ flip) - 8;
+    let b = (c2 as usize ^ persp as usize) * 48 + (s2 ^ flip) - 8;
+    PAIR_LOOKUP[a][b] as usize
+}
 
 pub struct Network {
     pub ft: Vec<i16>,      // [input_dim][ACC]
@@ -52,6 +81,7 @@ pub fn load(path: &str) -> Result<Network, String> {
     }
     let (input_dim, header) = match &data[0..4] {
         b"PZR1" => (768usize, 8usize),
+        b"PZRP" => (PAIR_INPUTS, 8usize),
         b"PZRH" => (
             u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize,
             12usize,
@@ -140,6 +170,21 @@ pub fn build_acc(net: &Network, board: &Board, persp: Color) -> [i16; ACC] {
         let row = &net.ft[f * ACC..(f + 1) * ACC];
         for (a, &w) in acc.iter_mut().zip(row) {
             *a += w;
+        }
+    }
+    if net.input_dim == PAIR_INPUTS {
+        let pawns = board.pieces(Piece::Pawn);
+        for s1 in pawns {
+            for s2 in pawns {
+                if s1 >= s2 || (s1 as usize % 8).abs_diff(s2 as usize % 8) > 1 {
+                    continue;
+                }
+                let f = pair_feature(persp, board.color_on(s1).unwrap(), s1 as usize,
+                                     board.color_on(s2).unwrap(), s2 as usize);
+                for (a, &w) in acc.iter_mut().zip(&net.ft[f * ACC..(f + 1) * ACC]) {
+                    *a = a.wrapping_add(w);
+                }
+            }
         }
     }
     acc
@@ -354,7 +399,53 @@ pub fn acc_update_known(
     if net.is_halfkp() {
         acc_update_hkp(net, acc, board, mv)
     } else {
-        acc_update_basic(net, acc, board, mv, moving, victim)
+        let mut updated = acc_update_basic(net, acc, board, mv, moving, victim);
+        if net.input_dim == PAIR_INPUTS
+            && (moving == Piece::Pawn || victim.is_some_and(|(p, _)| p == Piece::Pawn))
+        {
+            update_pawn_pairs(net, &mut updated, board, mv, moving, victim);
+        }
+        updated
+    }
+}
+
+fn update_pawn_pairs(net: &Network, acc: &mut Acc, board: &Board, mv: Move,
+                     moving: Piece, victim: Option<(Piece, cozy_chess::Square)>) {
+    use cozy_chess::BitBoard;
+    let before = [board.colored_pieces(Color::White, Piece::Pawn),
+                  board.colored_pieces(Color::Black, Piece::Pawn)];
+    let mut after = before;
+    let stm = board.side_to_move() as usize;
+    if moving == Piece::Pawn {
+        after[stm] ^= mv.from.bitboard();
+        if mv.promotion.is_none() {
+            after[stm] |= mv.to.bitboard();
+        }
+    }
+    if let Some((Piece::Pawn, sq)) = victim {
+        after[1 - stm] ^= sq.bitboard();
+    }
+    // Only pairs touching a changed pawn need an update. A pair with two changed
+    // endpoints is visited once, including captures where the occupant changes colour.
+    let changed: BitBoard = (before[0] ^ after[0]) | (before[1] ^ after[1]);
+    for (pawns, sign) in [(before, -1i16), (after, 1i16)] {
+        let all = pawns[0] | pawns[1];
+        for s1 in changed & all {
+            for s2 in all {
+                if s1 == s2 || (changed.has(s2) && s2 < s1)
+                    || (s1 as usize % 8).abs_diff(s2 as usize % 8) > 1 {
+                    continue;
+                }
+                let c1 = if pawns[0].has(s1) { Color::White } else { Color::Black };
+                let c2 = if pawns[0].has(s2) { Color::White } else { Color::Black };
+                for (persp, half) in [(Color::White, &mut acc.w), (Color::Black, &mut acc.b)] {
+                    let f = pair_feature(persp, c1, s1 as usize, c2, s2 as usize);
+                    for (a, &w) in half.iter_mut().zip(&net.ft[f * ACC..(f + 1) * ACC]) {
+                        *a = a.wrapping_add(w.wrapping_mul(sign));
+                    }
+                }
+            }
+        }
     }
 }
 
