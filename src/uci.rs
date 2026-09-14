@@ -25,12 +25,22 @@ fn build_pool(hash_mb: usize, n: usize, stop: &Arc<AtomicBool>) -> (Arc<TT>, Vec
     (tt, pool)
 }
 
+fn parse_fen(fields: &[&str]) -> Result<Board, String> {
+    let fen = match fields.len() {
+        4 => format!("{} 0 1", fields.join(" ")),
+        6 => fields.join(" "),
+        n => return Err(format!("expected 4 or 6 fields, got {n}")),
+    };
+    Board::from_fen(&fen, false).map_err(|e| e.to_string())
+}
+
 pub fn uci_loop() {
     let mut hash_mb: usize = 64;
     let mut n_threads: usize = 1;
     let stop = Arc::new(AtomicBool::new(false));
     let (mut tt, mut pool) = build_pool(hash_mb, n_threads, &stop);
     let mut board = Board::startpos();
+    let mut position_valid = true;
     let mut game_hist: Vec<u64> = Vec::new();
     // this side's own root scores across the game, for volatility-aware time management
     let mut eval_hist_game: Vec<i32> = Vec::new();
@@ -42,6 +52,9 @@ pub fn uci_loop() {
     // repertoire is at best redundant and at worst steers into a line the book stops in but the
     // search has never had to hold. Still available on request; just no longer the default.
     let mut own_book = false;
+    // Set by `ucinewgame`, cleared by the next `go`. Without it the first search of a new
+    // game pushes the LAST game's final score into the fresh volatility history.
+    let mut new_game = false;
     let mut adaptive_time = false;
     let mut move_overhead: u128 = 10;
     let mut book_seed: u64 = std::time::SystemTime::now()
@@ -149,46 +162,104 @@ pub fn uci_loop() {
                 }
             }
             Some("ucinewgame") => {
+                stop.store(true, Ordering::Relaxed);
+                for h in workers.drain(..) {
+                    let _ = h.join();
+                }
                 tt.clear();
+                for searcher in &pool {
+                    if let Ok(mut searcher) = searcher.lock() {
+                        searcher.new_game();
+                    }
+                }
+                // Per-GAME state, so it is cleared HERE and not in `position` -- see below.
+                eval_hist_game.clear();
+                new_game = true;
             }
             Some("position") => {
                 let mut idx = 1;
+                let mut next_board;
                 if tokens.get(idx) == Some(&"startpos") {
-                    board = Board::startpos();
+                    next_board = Board::startpos();
                     idx += 1;
                 } else if tokens.get(idx) == Some(&"fen") {
                     let end = tokens
                         .iter()
                         .position(|&t| t == "moves")
                         .unwrap_or(tokens.len());
-                    let fen = tokens[idx + 1..end].join(" ");
-                    match Board::from_fen(&fen, false) {
-                        Ok(b) => board = b,
+                    match parse_fen(&tokens[idx + 1..end]) {
+                        Ok(b) => next_board = b,
                         Err(e) => {
                             println!("info string bad fen: {e}");
+                            position_valid = false;
+                            game_hist.clear();
                             continue;
                         }
                     }
                     idx = end;
+                } else {
+                    println!("info string bad position command");
+                    position_valid = false;
+                    game_hist.clear();
+                    continue;
                 }
-                game_hist.clear();
-                eval_hist_game.clear();
+                position_valid = true;
+                let mut next_hist = Vec::new();
+                // NOT eval_hist_game. A GUI sends `position` before every single `go`, so
+                // clearing it here capped it at one entry for ever, `recent_volatility()`
+                // (which needs three) could only ever return None, and VOL_TM was a no-op
+                // however it was gated. That is why the 2912-game `voltm` campaign row read
+                // -4.89 +/- 8.52: it measured a binary against itself. Bug present since
+                // a040d63, the commit that added the feature. See AUDIT_SEARCH_20260913.md S1.
+                // `ucinewgame` clears it.
                 if tokens.get(idx) == Some(&"moves") {
                     for mv_str in &tokens[idx + 1..] {
-                        match parse_uci_move(&board, mv_str) {
+                        // `parse_uci_move` PARSES; it does not validate. Its whole body is a
+                        // string parse plus the king-takes-rook castling conversion, so it
+                        // returns Ok for any well-formed <sq><sq>[promo] -- including moves
+                        // that are illegal in this position. `play_unchecked` then executes
+                        // them, and two of the resulting states are fatal, both measured:
+                        //
+                        //   moves e2e4 e7e5 e2e5   -> panic "Missing piece on move's from
+                        //                             square" ON THE MAIN THREAD: process dies.
+                        //   moves ... Qxe8 (king)  -> board with no king; the SEARCH thread
+                        //                             panics "No king was found", main lives,
+                        //                             no bestmove is ever sent and the GUI hangs.
+                        //
+                        // A conforming GUI never sends these, which is exactly why it went
+                        // unnoticed. `is_legal` is the same guard the book probe and
+                        // `packed_to_move` already use to make an illegal move impossible.
+                        match parse_uci_move(&next_board, mv_str) {
+                            Ok(mv) if !next_board.is_legal(mv) => {
+                                println!("info string illegal move {mv_str}");
+                                position_valid = false;
+                                break;
+                            }
                             Ok(mv) => {
-                                game_hist.push(board.hash());
-                                board.play_unchecked(mv);
+                                next_hist.push(crate::search::repetition_hash(&next_board));
+                                next_board.play_unchecked(mv);
                             }
                             Err(e) => {
                                 println!("info string bad move {mv_str}: {e}");
+                                position_valid = false;
                                 break;
                             }
                         }
                     }
                 }
+                if position_valid {
+                    board = next_board;
+                    game_hist = next_hist;
+                } else {
+                    game_hist.clear();
+                }
             }
             Some("go") => {
+                if !position_valid {
+                    println!("info string no valid position");
+                    println!("bestmove 0000");
+                    continue;
+                }
                 // book probe: instant reply while the position is in repertoire
                 if own_book && !tokens.contains(&"infinite") {
                     if let Some(mv) = book.probe(board.hash(), &mut book_seed) {
@@ -227,11 +298,12 @@ pub fn uci_loop() {
                 // has finished, so no extra synchronisation is needed. These are all THIS
                 // side's own scores, from its own perspective, which is exactly the per-side
                 // sequence the AUC 0.81 measurement was made on.
-                if had_prev {
+                if had_prev && !new_game {
                     if let Ok(s0) = pool[0].lock() {
                         eval_hist_game.push(s0.last_score);
                     }
                 }
+                new_game = false;
                 stop.store(false, Ordering::Relaxed); // reset once, before any thread starts
                 for (i, s) in pool.iter().enumerate() {
                     let s = s.clone();
@@ -240,6 +312,7 @@ pub fn uci_loop() {
                     let evh = eval_hist_game.clone();
                     let limits = limits.clone();
                     let is_main = i == 0;
+                    let worker_stop = stop.clone();
                     workers.push(std::thread::spawn(move || {
                         let mut s = match s.try_lock() {
                             Ok(s) => s,
@@ -253,6 +326,17 @@ pub fn uci_loop() {
                         s.game_hist = hist;
                         s.eval_hist_game = evh;
                         let best = s.think(&board, &limits);
+                        if is_main {
+                            // The main thread has decided, so nothing a helper still finds can
+                            // be used. Without this they run on to their OWN limits, which under
+                            // a real clock are far apart (soft = t/30, hard = t/6): measured
+                            // 1.48 CPU-SECONDS burned AFTER `bestmove` at Threads=4, 60+0.6.
+                            // That is CPU spent during the opponent's turn, and work the next
+                            // `go` must join() before it can start searching. Invisible to the
+                            // bench signature, which is fixed-depth and single-threaded.
+                            // See AUDIT_SEARCH_20260913.md S2.
+                            worker_stop.store(true, Ordering::Relaxed);
+                        }
                         if is_main {
                             match best {
                                 Some(mv) => println!("bestmove {}", display_uci_move(&board, mv)),
@@ -287,5 +371,37 @@ pub fn uci_loop() {
     stop.store(true, Ordering::Relaxed);
     for h in workers.drain(..) {
         let _ = h.join(); // let the search print bestmove before the process exits
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn four_field_fen_gets_default_move_counters() {
+        let short = parse_fen(&["8/8/8/8/8/8/4k3/7K", "w", "-", "-"]).unwrap();
+        let full = parse_fen(&["8/8/8/8/8/8/4k3/7K", "w", "-", "-", "0", "1"]).unwrap();
+        assert_eq!(short, full);
+    }
+
+    /// The trap the `is_legal` guard in the move loop exists for. If cozy ever starts
+    /// validating in `parse_uci_move`, this test fails and the comment there becomes wrong --
+    /// which is the point: the guard is justified by this behaviour, so the behaviour is
+    /// pinned. Both moves below are well-formed strings and illegal on the board.
+    #[test]
+    fn parse_uci_move_accepts_illegal_moves_so_we_must_check() {
+        let b = Board::from_fen(
+            "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2", false).unwrap();
+        let blocked = parse_uci_move(&b, "a1a8").expect("parse_uci_move rejected a1a8");
+        assert!(!b.is_legal(blocked), "a1a8 is blocked by the a2 pawn");
+        let empty_from = parse_uci_move(&b, "e2e5").expect("parse_uci_move rejected e2e5");
+        assert!(!b.is_legal(empty_from), "e2 is empty after e2e4");
+    }
+
+    #[test]
+    fn malformed_fen_is_rejected() {
+        assert!(parse_fen(&["not-a-board", "w", "-", "-"]).is_err());
+        assert!(parse_fen(&["8/8/8/8/8/8/4k3/7K", "w", "-"]).is_err());
     }
 }

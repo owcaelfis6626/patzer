@@ -404,6 +404,9 @@ fn nnueinc(net_path: &str) {
     for _ in 0..1000 {
         let mut board = Board::startpos();
         let mut acc = nnue::acc_from(&net, &board);
+        let mut cached = acc.clone();
+        let mut cache = nnue::HalfKpCache::new();
+        cache.seed(&board, &cached);
         for _ in 0..200 {
             if board.status() != GameStatus::Ongoing {
                 break;
@@ -429,9 +432,12 @@ fn nnueinc(net_path: &str) {
                 eps += 1;
             }
             acc = nnue::acc_update(&net, &acc, &board, mv);
+            cached = nnue::acc_update_cached(&net, &mut cache, &cached, &board, mv);
             board.play_unchecked(mv);
             let scratch = nnue::acc_from(&net, &board);
-            if acc.w != scratch.w || acc.b != scratch.b {
+            if acc.w != scratch.w || acc.b != scratch.b
+                || cached.w != scratch.w || cached.b != scratch.b
+            {
                 println!("  MISMATCH after {mv} at\n  {board}");
                 println!("  => GATE FAIL");
                 std::process::exit(1);

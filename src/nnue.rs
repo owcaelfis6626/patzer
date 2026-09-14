@@ -7,7 +7,7 @@
 //! Forward: acc(i16, clamp 0..127) -> l1 i32 -> clamp 0..8128 -> /64 (0..127) -> l2 i32 = v2;
 //! cp = v2 * 400 / 8128, truncated toward zero (Rust i32 division semantics).
 
-use cozy_chess::{Board, Color, Move, Piece};
+use cozy_chess::{BitBoard, Board, Color, Move, Piece};
 use std::sync::OnceLock;
 
 pub const ACC: usize = 256;
@@ -336,6 +336,82 @@ pub struct Acc {
     pub b: [i16; ACC],
 }
 
+#[derive(Clone)]
+struct HalfKpCacheEntry {
+    valid: bool,
+    pieces: [BitBoard; 10],
+    acc: [i16; ACC],
+}
+
+/// Per-searcher Finny cache. Each entry retains the last accumulator and piece set seen for
+/// one perspective/king-square bucket, so revisiting a bucket applies only the piece delta.
+pub struct HalfKpCache {
+    entries: Vec<HalfKpCacheEntry>,
+}
+
+impl HalfKpCache {
+    pub fn new() -> Self {
+        let entry = HalfKpCacheEntry {
+            valid: false,
+            pieces: [BitBoard::EMPTY; 10],
+            acc: [0; ACC],
+        };
+        Self { entries: vec![entry; 2 * 64] }
+    }
+
+    pub fn clear(&mut self) {
+        for entry in &mut self.entries {
+            entry.valid = false;
+        }
+    }
+
+    pub fn seed(&mut self, board: &Board, acc: &Acc) {
+        let pieces = hkp_piece_set(board);
+        for (persp, half) in [(Color::White, acc.w), (Color::Black, acc.b)] {
+            let index = persp as usize * 64 + board.king(persp) as usize;
+            self.entries[index] = HalfKpCacheEntry { valid: true, pieces, acc: half };
+        }
+    }
+
+    fn refresh(&mut self, net: &Network, board: &Board, persp: Color) -> [i16; ACC] {
+        let ksq = board.king(persp) as usize;
+        let index = persp as usize * 64 + ksq;
+        let current = hkp_piece_set(board);
+        let entry = &mut self.entries[index];
+        if !entry.valid {
+            entry.acc = build_acc(net, board, persp);
+            entry.pieces = current;
+            entry.valid = true;
+            return entry.acc;
+        }
+
+        let mut acc = entry.acc;
+        for i in 0..10 {
+            let color = if i < 5 { Color::White } else { Color::Black };
+            let piece = i % 5;
+            for sq in entry.pieces[i] & !current[i] {
+                hkp_sub(&mut acc, net, persp, ksq, color, piece, sq as usize);
+            }
+            for sq in current[i] & !entry.pieces[i] {
+                hkp_add(&mut acc, net, persp, ksq, color, piece, sq as usize);
+            }
+        }
+        entry.acc = acc;
+        entry.pieces = current;
+        acc
+    }
+}
+
+fn hkp_piece_set(board: &Board) -> [BitBoard; 10] {
+    let mut pieces = [BitBoard::EMPTY; 10];
+    for color in [Color::White, Color::Black] {
+        for piece in 0..5 {
+            pieces[color as usize * 5 + piece] = board.colored_pieces(color, Piece::index(piece));
+        }
+    }
+    pieces
+}
+
 pub fn acc_from(net: &Network, board: &Board) -> Acc {
     Acc {
         w: build_acc(net, board, Color::White),
@@ -383,6 +459,26 @@ pub fn acc_update(net: &Network, acc: &Acc, board: &Board, mv: Move) -> Acc {
     acc_update_known(net, acc, board, mv, moving, victim)
 }
 
+pub fn acc_update_cached(
+    net: &Network,
+    cache: &mut HalfKpCache,
+    acc: &Acc,
+    board: &Board,
+    mv: Move,
+) -> Acc {
+    use cozy_chess::Square;
+    let moving = board.piece_on(mv.from).expect("no piece on from");
+    let victim = match board.piece_on(mv.to) {
+        Some(v) if board.color_on(mv.to) != Some(board.side_to_move()) => Some((v, mv.to)),
+        Some(_) => None,
+        None if moving == Piece::Pawn && mv.from.file() != mv.to.file() => {
+            Some((Piece::Pawn, Square::new(mv.to.file(), mv.from.rank())))
+        }
+        None => None,
+    };
+    acc_update_known_cached(net, cache, acc, board, mv, moving, victim)
+}
+
 /// As `acc_update`, but told which piece is moving and what it captures.
 ///
 /// `victim` is the captured piece and the square it stood on -- for en passant that is
@@ -399,14 +495,74 @@ pub fn acc_update_known(
     if net.is_halfkp() {
         acc_update_hkp(net, acc, board, mv)
     } else {
-        let mut updated = acc_update_basic(net, acc, board, mv, moving, victim);
-        if net.input_dim == PAIR_INPUTS
-            && (moving == Piece::Pawn || victim.is_some_and(|(p, _)| p == Piece::Pawn))
-        {
-            update_pawn_pairs(net, &mut updated, board, mv, moving, victim);
-        }
-        updated
+        acc_update_non_hkp(net, acc, board, mv, moving, victim)
     }
+}
+
+#[inline]
+fn acc_update_non_hkp(
+    net: &Network,
+    acc: &Acc,
+    board: &Board,
+    mv: Move,
+    moving: Piece,
+    victim: Option<(Piece, cozy_chess::Square)>,
+) -> Acc {
+    let mut updated = acc_update_basic(net, acc, board, mv, moving, victim);
+    if net.input_dim == PAIR_INPUTS
+        && (moving == Piece::Pawn || victim.is_some_and(|(p, _)| p == Piece::Pawn))
+    {
+        update_pawn_pairs(net, &mut updated, board, mv, moving, victim);
+    }
+    updated
+}
+
+pub fn acc_update_known_cached(
+    net: &Network,
+    cache: &mut HalfKpCache,
+    acc: &Acc,
+    board: &Board,
+    mv: Move,
+    moving: Piece,
+    victim: Option<(Piece, cozy_chess::Square)>,
+) -> Acc {
+    if !net.is_halfkp() {
+        return acc_update_non_hkp(net, acc, board, mv, moving, victim);
+    }
+
+    let stm = board.side_to_move();
+    let castling = board.color_on(mv.to) == Some(stm);
+    if moving != Piece::King && !castling {
+        return acc_update_hkp(net, acc, board, mv);
+    }
+
+    use cozy_chess::{File, Square};
+    let them = match stm {
+        Color::White => Color::Black,
+        Color::Black => Color::White,
+    };
+    let mut next = board.clone();
+    next.play_unchecked(mv);
+    let mut updated = acc.clone();
+    let oksq = board.king(them) as usize;
+    let other = match stm {
+        Color::White => &mut updated.b,
+        Color::Black => &mut updated.w,
+    };
+    if castling {
+        let back = mv.from.rank();
+        let rf = if mv.to.file() > mv.from.file() { File::F } else { File::D };
+        hkp_sub(other, net, them, oksq, stm, Piece::Rook as usize, mv.to as usize);
+        hkp_add(other, net, them, oksq, stm, Piece::Rook as usize,
+                Square::new(rf, back) as usize);
+    } else if let Some((captured, square)) = victim {
+        hkp_sub(other, net, them, oksq, them, captured as usize, square as usize);
+    }
+    match stm {
+        Color::White => updated.w = cache.refresh(net, &next, Color::White),
+        Color::Black => updated.b = cache.refresh(net, &next, Color::Black),
+    }
+    updated
 }
 
 fn update_pawn_pairs(net: &Network, acc: &mut Acc, board: &Board, mv: Move,

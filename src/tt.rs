@@ -34,24 +34,52 @@ pub struct Entry {
     pub score: i16,
     pub depth: i8,
     pub bound: u8,
+    /// Raw (uncorrected) static evaluation. `-8192` means unavailable.
+    pub eval: i16,
+    /// The score was searched as a PV node. This is sticky for an entry's lifetime.
+    pub tt_pv: bool,
 }
 
-// data word layout: mv:16 | score:16 | depth:8 | bound:8 | age:8 (56 of 64 bits used)
-fn pack_data(mv: u16, score: i16, depth: i8, bound: u8, age: u8) -> u64 {
+pub const EVAL_NONE: i16 = -8192;
+
+#[derive(Clone, Copy)]
+pub struct StoreData {
+    pub mv: u16,
+    pub score: i32,
+    pub depth: i32,
+    pub bound: u8,
+    pub eval: i32,
+    pub tt_pv: bool,
+}
+
+// data word layout: mv:16 | score:16 | depth:8 | bound:2 | age:5 | tt_pv:1 | eval:14.
+// The two high bits remain zero. Keeping the value in the existing word preserves the
+// four-entry cache-line layout and avoids a second atomic load on every probe.
+fn pack_data(mv: u16, score: i16, depth: i8, bound: u8, age: u8, eval: i16, tt_pv: bool) -> u64 {
+    let eval_bits = (eval.clamp(-8192, 8191) as i32 & 0x3fff) as u64;
     (mv as u64)
         | ((score as u16 as u64) << 16)
         | ((depth as u8 as u64) << 32)
-        | ((bound as u64) << 40)
-        | ((age as u64) << 48)
+        | (((bound & 0x3) as u64) << 40)
+        | (((age & 0x1f) as u64) << 42)
+        | ((tt_pv as u64) << 47)
+        | (eval_bits << 48)
 }
 
-fn unpack_data(data: u64) -> (u16, i16, i8, u8, u8) {
+fn unpack_data(data: u64) -> (u16, i16, i8, u8, u8, i16, bool) {
     let mv = data as u16;
     let score = (data >> 16) as u16 as i16;
     let depth = (data >> 32) as u8 as i8;
-    let bound = (data >> 40) as u8;
-    let age = (data >> 48) as u8;
-    (mv, score, depth, bound, age)
+    let bound = ((data >> 40) & 0x3) as u8;
+    let age = ((data >> 42) & 0x1f) as u8;
+    let tt_pv = ((data >> 47) & 1) != 0;
+    let eval_bits = ((data >> 48) & 0x3fff) as i16;
+    let eval = if eval_bits & 0x2000 != 0 {
+        eval_bits | !0x3fff
+    } else {
+        eval_bits
+    };
+    (mv, score, depth, bound, age, eval, tt_pv)
 }
 
 struct Slot {
@@ -147,17 +175,17 @@ impl TT {
             if kx ^ data != key {
                 continue; // torn read or genuine miss -- either way, not a hit
             }
-            let (mv, score, depth, bound, _age) = unpack_data(data);
+            let (mv, score, depth, bound, _age, eval, tt_pv) = unpack_data(data);
             if bound == BOUND_NONE {
                 continue;
             }
-            return Some(Entry { mv, score, depth, bound });
+            return Some(Entry { mv, score, depth, bound, eval, tt_pv });
         }
         None
     }
 
-    pub fn store(&self, key: u64, mv: u16, score: i32, depth: i32, bound: u8) {
-        let cur_age = self.age.load(Ordering::Relaxed);
+    pub fn store(&self, key: u64, entry: StoreData) {
+        let cur_age = self.age.load(Ordering::Relaxed) & 0x1f;
         let cluster = self.cluster(key);
 
         // Pick the destination. A slot already holding THIS position always wins -- two entries
@@ -176,7 +204,7 @@ impl TT {
         for (i, slot) in cluster.iter().enumerate() {
             let kx = slot.key_xor_data.load(Ordering::Relaxed);
             let old_data = slot.data.load(Ordering::Relaxed);
-            let (_, _, old_depth, old_bound, old_age) = unpack_data(old_data);
+            let (_, _, old_depth, old_bound, old_age, _, _) = unpack_data(old_data);
             if kx ^ old_data == key && old_bound != BOUND_NONE {
                 found = Some((i, old_depth, old_data));
                 break;
@@ -194,23 +222,24 @@ impl TT {
             }
         }
 
-        let (idx, keep_mv) = match found {
+        let (idx, keep_mv, keep_eval, keep_pv) = match found {
             Some((i, old_depth, old_data)) => {
                 // Same position: only overwrite with something at least as deep, unless the
                 // entry is stale (from an earlier search) or this is an exact score at equal
                 // depth. A shallower bound must not erase a deeper one.
-                let (old_mv, _, _, _, old_age) = unpack_data(old_data);
-                if depth < old_depth as i32 && old_age == cur_age && bound != BOUND_EXACT {
+                let (old_mv, _, _, _, old_age, old_eval, old_pv) = unpack_data(old_data);
+                if entry.depth < old_depth as i32 && old_age == cur_age && entry.bound != BOUND_EXACT {
                     return;
                 }
-                (i, if mv == 0 { old_mv } else { mv })
+                (i, if entry.mv == 0 { old_mv } else { entry.mv },
+                    if entry.eval == EVAL_NONE as i32 { old_eval } else { entry.eval.clamp(-8192, 8191) as i16 }, old_pv || entry.tt_pv)
             }
-            None => (victim, mv),
+            None => (victim, entry.mv, entry.eval.clamp(-8192, 8191) as i16, entry.tt_pv),
         };
 
-        let score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        let depth = depth.clamp(-128, 127) as i8;
-        let data = pack_data(keep_mv, score, depth, bound, cur_age);
+        let score = entry.score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let depth = entry.depth.clamp(-128, 127) as i8;
+        let data = pack_data(keep_mv, score, depth, entry.bound, cur_age, keep_eval, keep_pv);
         let slot = &cluster[idx];
         slot.data.store(data, Ordering::Relaxed);
         slot.key_xor_data.store(key ^ data, Ordering::Relaxed);
@@ -221,7 +250,7 @@ impl TT {
 /// `go`, so plain subtraction would call a 1-vs-255 gap "254 searches ago" instead of one.
 #[inline]
 fn age_distance(cur: u8, old: u8) -> i32 {
-    cur.wrapping_sub(old) as i32
+    cur.wrapping_sub(old) as i32 & 0x1f
 }
 
 #[cfg(test)]
@@ -277,10 +306,10 @@ mod tests {
         let tt = TT::new(1);
         let clusters = (tt.mask + 1) as u64;
         let deep_key = 0x1234_5678_9abc_def0u64;
-        tt.store(deep_key, 42, 100, 30, BOUND_EXACT);
+        tt.store(deep_key, StoreData { mv: 42, score: 100, depth: 30, bound: BOUND_EXACT, eval: 321, tt_pv: true });
         // keys differing by a multiple of the cluster count share a cluster
         for i in 1..=3u64 {
-            tt.store(deep_key.wrapping_add(i * clusters), 7, 5, 1, BOUND_UPPER);
+            tt.store(deep_key.wrapping_add(i * clusters), StoreData { mv: 7, score: 5, depth: 1, bound: BOUND_UPPER, eval: -8192, tt_pv: false });
         }
         let e = tt.probe(deep_key).expect("the depth-30 entry was evicted by shallow stores");
         assert_eq!(e.depth, 30);
@@ -292,11 +321,22 @@ mod tests {
     fn a_shallow_result_does_not_erase_a_deeper_one_for_the_same_key() {
         let tt = TT::new(1);
         let k = 0xdead_beef_0000_0001u64;
-        tt.store(k, 11, 50, 20, BOUND_LOWER);
-        tt.store(k, 22, 60, 3, BOUND_LOWER);
+        tt.store(k, StoreData { mv: 11, score: 50, depth: 20, bound: BOUND_LOWER, eval: 77, tt_pv: false });
+        tt.store(k, StoreData { mv: 22, score: 60, depth: 3, bound: BOUND_LOWER, eval: -8192, tt_pv: false });
         let e = tt.probe(k).unwrap();
         assert_eq!(e.depth, 20, "a depth-3 store overwrote a depth-20 entry");
         assert_eq!(e.mv, 11);
+    }
+
+    #[test]
+    fn static_eval_and_pv_metadata_survive_a_replacement() {
+        let tt = TT::new(1);
+        let k = 0xdead_beef_0000_0002u64;
+        tt.store(k, StoreData { mv: 11, score: 50, depth: 20, bound: BOUND_LOWER, eval: 77, tt_pv: false });
+        tt.store(k, StoreData { mv: 22, score: 60, depth: 20, bound: BOUND_LOWER, eval: -8192, tt_pv: true });
+        let e = tt.probe(k).unwrap();
+        assert_eq!(e.eval, 77, "a missing static eval erased the cached value");
+        assert!(e.tt_pv, "PV metadata should be sticky");
     }
 
     /// A stale entry (written several searches ago) is worth less than a fresh one even if it
