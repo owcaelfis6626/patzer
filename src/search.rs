@@ -50,7 +50,7 @@
 
 use crate::eval::{evaluate, piece_val};
 use crate::nnue;
-use crate::tt::{pack, BOUND_EXACT, BOUND_LOWER, BOUND_UPPER, EVAL_NONE, StoreData, TT};
+use crate::tt::{pack, BOUND_EXACT, BOUND_LOWER, BOUND_UPPER, TT};
 use cozy_chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks, get_rook_moves,
     BitBoard, Board, Color, Move, Piece, Rank, Square,
@@ -1375,10 +1375,7 @@ impl Searcher {
             } else {
                 BOUND_UPPER
             };
-            self.tt.store(hash, StoreData {
-                mv: best_mv, score: tt_score_to(best, ply), depth: 0, bound,
-                eval: EVAL_NONE as i32, tt_pv: false,
-            });
+            self.tt.store(hash, best_mv, tt_score_to(best, ply), 0, bound);
         }
         best
     }
@@ -1492,8 +1489,6 @@ impl Searcher {
         let mut tt_depth: i32 = -1;
         let mut tt_score: i32 = 0;
         let mut tt_bound: u8 = 0;
-        let mut tt_eval: Option<i32> = None;
-        let mut tt_pv = false;
         // Hoisted above the probe (2026-08-18). NOT used by the TT cutoff below -- it feeds
         // LMP/LMR later. It only reads the window, so it is computable this early.
         let is_pv = beta - alpha > 1;
@@ -1503,8 +1498,6 @@ impl Searcher {
                 tt_depth = e.depth as i32;
                 tt_score = tt_score_from(e.score as i32, ply);
                 tt_bound = e.bound;
-                tt_eval = (e.eval != EVAL_NONE).then_some(e.eval as i32);
-                tt_pv = e.tt_pv;
                 // DELIBERATELY NO PV GUARD. An earlier comment here claimed "no TT cutoff in a
                 // PV node"; this code has never had that guard. Adding it was measured at
                 // -38.21 +/- 18.34 and removed (c34ad12). The cutoff below is depth- and
@@ -1535,10 +1528,7 @@ impl Searcher {
         }
 
         let stm = board.side_to_move();
-        // A TT entry carries the raw static evaluation separately from its search score. Reuse
-        // it even when the depth/bound is insufficient for a cutoff; correction history is
-        // applied locally because it depends on this searcher's learned tables.
-        let raw_eval = tt_eval.unwrap_or_else(|| self.eval_node(board, acc));
+        let raw_eval = self.eval_node(board, acc);
         // Everything downstream -- improving, reverse futility, null move, LMP -- reads the
         // CORRECTED eval. That is the point: the corrections are only worth anything if they
         // reach the pruning decisions the static eval drives.
@@ -1656,7 +1646,6 @@ impl Searcher {
             && ply > 0
             && depth >= PROBCUT_MIN_DEPTH
             && beta.abs() < MATE_BOUND
-            && excl == 0
             && !(tt_depth >= depth - PROBCUT_REDUCTION && tt_score < beta + PROBCUT_MARGIN
                  && tt_bound != 0u8)
         {
@@ -1698,13 +1687,6 @@ impl Searcher {
                 }
                 if v >= pc_beta {
                     self.pc_buf[ply as usize] = cands;
-                    // ProbCut paid for a reduced search to establish this lower bound. Keep it
-                    // for transpositions, but never let a singular-verification search publish
-                    // a result for the unexcluded position (the `excl == 0` guard above).
-                    self.tt.store(hash, StoreData {
-                        mv: pack(mv), score: tt_score_to(v, ply), depth: pc_depth,
-                        bound: BOUND_LOWER, eval: raw_eval, tt_pv: false,
-                    });
                     return v;
                 }
             }
@@ -2180,10 +2162,8 @@ impl Searcher {
 
         // never store a verification search: its score is for the position MINUS one move
         if excl == 0 {
-            self.tt.store(hash, StoreData {
-                mv: best_mv, score: tt_score_to(best, ply), depth, bound,
-                eval: raw_eval, tt_pv: is_pv || tt_pv,
-            });
+            self.tt
+                .store(hash, best_mv, tt_score_to(best, ply), depth, bound);
             // same exclusion, same reason: a verification score describes a different position,
             // and `in_check` is already known false here (checks went to qsearch at the top).
             if !in_check {
@@ -2269,16 +2249,6 @@ impl Searcher {
         self.hard_ms = if limits.infinite { u128::MAX } else { hard };
 
         let max_depth = limits.depth.unwrap_or(MAX_PLY as i32 - 1).min(MAX_PLY as i32 - 1);
-
-        // A forced position has no ordering or depth decision to make. Return its only legal
-        // move immediately; returning None for zero legal moves preserves the checkmate and
-        // stalemate result expected by the UCI caller. Do not bypass an already-requested stop.
-        if self.stop.load(Ordering::Relaxed) {
-            return None;
-        }
-        if let Some(forced) = forced_move(board) {
-            return forced;
-        }
 
         // root accumulator: Some iff a net is loaded (the invariant eval_node relies on)
         let root_acc = nnue::net().map(|n| nnue::acc_from(n, board));
@@ -2430,30 +2400,6 @@ fn packed_to_move(board: &Board, packed: u16) -> Option<Move> {
         false
     });
     found
-}
-
-/// Return `Some(Some(move))` for exactly one legal move, `Some(None)` for no legal moves, and
-/// `None` when at least two moves exist. Generation stops after the second move, so this is a
-/// cheap root-only probe and never allocates a move list.
-fn forced_move(board: &Board) -> Option<Option<Move>> {
-    let mut count = 0u8;
-    let mut only = None;
-    board.generate_moves(|pm| {
-        for mv in pm {
-            count += 1;
-            if count == 1 {
-                only = Some(mv);
-            } else {
-                return true;
-            }
-        }
-        false
-    });
-    match count {
-        0 => Some(None),
-        1 => Some(only),
-        _ => None,
-    }
 }
 
 #[inline]
@@ -2700,15 +2646,6 @@ fn tt_score_from(s: i32, ply: i32) -> i32 {
 #[cfg(test)]
 mod ep_tests {
     use super::*;
-
-    #[test]
-    fn forced_move_probe_distinguishes_zero_one_and_many_moves() {
-        assert!(forced_move(&Board::startpos()).is_none());
-        let one = Board::from_fen("7k/5K2/8/8/8/8/8/8 b - - 0 1", false).unwrap();
-        assert!(forced_move(&one).flatten().is_some());
-        let none = Board::from_fen("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", false).unwrap();
-        assert_eq!(forced_move(&none), Some(None));
-    }
 
     #[test]
     fn search_start_preserves_a_pending_stop() {
