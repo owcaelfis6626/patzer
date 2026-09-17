@@ -257,6 +257,13 @@ const NULL_CONT: usize = usize::MAX; // sentinel: no continuation across a null 
 // read per node -- unlike the accumulator this sits BESIDE the net, so it does not disturb
 // incremental updates.
 const CORR_HIST: bool = true; // correction history on the static eval
+// F4 (audit 2026-09-17): target the correction at the residual against the RAW eval rather than
+// the already-corrected one. The corrected target made the fixed point `c = (best-raw)/2`, so the
+// table learned half the standing bias. The algebra is a genuine bug, but fixing it grows the bench
+// tree by ~40% at depth 13-14 (292710 -> 299474 at d11, 765400 -> 1096134 at d13), so it is a
+// behaviour-changing experiment, not a free fix: it ships OFF and needs an equal-time SPRT before
+// it can be enabled. `correction_target_uses_the_raw_eval` is the unit gate.
+const CORR_RAW_TARGET: bool = false;
 const CORR_SIZE: usize = 16_384; // 2^14 pawn-structure buckets per side
 const CORR_GRAIN: i32 = 256; // entries kept in 1/256 pawn units so the EMA stays smooth in i32
 const CORR_MAX: i32 = 128 * CORR_GRAIN; // never shift the eval by more than ~128cp
@@ -522,14 +529,13 @@ pub mod instrument {
     }
 }
 
-/// Dead draws by material, conservatively: K vs K, K+minor vs K, and K+N+N vs K (which cannot
-/// be forced). Deliberately NOT K+B vs K+B -- that depends on square colour and can be won when
-/// the bishops are same-coloured is false, but the general case needs care and a wrong "draw"
-/// throws away real wins. Anything with a pawn, rook or queen returns immediately.
+/// Exact draws by material: K vs K and K+minor vs K. Neither side can win these, so they are
+/// TERMINAL draws, not an evaluation adjustment -- that is the distinction F5 (2026-09-17) asked
+/// for. Anything with a pawn, rook or queen returns false.
 #[inline]
-fn insufficient_material(board: &Board) -> bool {
+fn is_dead_material(board: &Board) -> bool {
     let occ = board.occupied();
-    if occ.len() > 4 {
+    if occ.len() > 3 {
         return false;
     }
     if !board.pieces(Piece::Pawn).is_empty()
@@ -538,15 +544,31 @@ fn insufficient_material(board: &Board) -> bool {
     {
         return false;
     }
-    let knights = board.pieces(Piece::Knight).len();
-    let bishops = board.pieces(Piece::Bishop).len();
+    let minors = board.pieces(Piece::Knight).len() + board.pieces(Piece::Bishop).len();
     match occ.len() {
-        2 => true,                                  // K vs K
-        3 => knights + bishops == 1,                // K + one minor vs K
-        4 => knights == 2 && bishops == 0           // K+N+N vs K: not forceable
-            && (board.pieces(Piece::Knight) & board.colors(Color::White)).len() != 1,
+        2 => true,        // K vs K
+        3 => minors == 1, // K + one minor vs K
         _ => false,
     }
+}
+
+/// Drawish but NOT terminal: K+N+N vs K cannot be forced, but a mate is possible (unforceable is
+/// not impossible), so this is a heuristic evaluation adjustment rather than a rule.
+#[inline]
+fn is_drawish_material(board: &Board) -> bool {
+    let occ = board.occupied();
+    if occ.len() != 4 {
+        return false;
+    }
+    if !board.pieces(Piece::Pawn).is_empty()
+        || !board.pieces(Piece::Rook).is_empty()
+        || !board.pieces(Piece::Queen).is_empty()
+    {
+        return false;
+    }
+    board.pieces(Piece::Knight).len() == 2
+        && board.pieces(Piece::Bishop).is_empty()
+        && (board.pieces(Piece::Knight) & board.colors(Color::White)).len() != 1
 }
 
 fn opp(c: Color) -> Color {
@@ -671,15 +693,29 @@ pub fn see(board: &Board, mv: Move) -> i32 {
 /// where the `None` guard is still meaningful.
 pub fn see_with(board: &Board, mv: Move, attacker: Piece) -> i32 {
     let target = mv.to;
-    // en passant: to-square is empty but a pawn is captured
-    let mut captured = board.piece_on(target).map(piece_val).unwrap_or(0);
-    if captured == 0 && attacker == Piece::Pawn && mv.from.file() != target.file() {
-        captured = piece_val(Piece::Pawn);
+    // Castling is encoded as king-takes-own-rook, so `target` holds our OWN rook. It is not a
+    // capture; return 0 rather than crediting our own piece. (F17, 2026-09-17.)
+    if board.color_on(target) == Some(board.side_to_move()) {
+        return 0;
     }
+    // en passant: to-square is empty but a pawn is captured on (to.file, from.rank)
+    let mut captured = board.piece_on(target).map(piece_val).unwrap_or(0);
+    let ep_victim = if captured == 0 && attacker == Piece::Pawn && mv.from.file() != target.file() {
+        captured = piece_val(Piece::Pawn);
+        Some(Square::new(target.file(), mv.from.rank()))
+    } else {
+        None
+    };
 
     let mut gain = [0i32; 32];
     gain[0] = captured;
+    // F3 (2026-09-17): the en-passant victim is NOT on `target`, so it must be removed from
+    // occupancy explicitly. Previously it stayed on the board and could block the rook/bishop/
+    // queen rays the capture had just opened, hiding a recapture. Non-ep moves are unchanged.
     let mut occ = board.occupied() ^ mv.from.bitboard();
+    if let Some(vsq) = ep_victim {
+        occ ^= vsq.bitboard();
+    }
     let mut next_victim = attacker;
     let mut stm = opp(board.side_to_move());
     let mut d = 0usize;
@@ -924,6 +960,14 @@ mod repetition_hash_tests {
     }
 }
 
+/// The correction-history target in centipawns, clamped to the table's range: the residual of the
+/// searched score against the RAW eval (`use_raw`, F4) or against the corrected eval (legacy).
+#[inline]
+fn corr_target_cp(best: i32, static_eval: i32, raw_eval: i32, use_raw: bool) -> i32 {
+    let base = if use_raw { raw_eval } else { static_eval };
+    (best - base).clamp(-CORR_MAX / CORR_GRAIN, CORR_MAX / CORR_GRAIN)
+}
+
 impl Searcher {
     pub fn new(hash_mb: usize) -> Self {
         Self::for_thread(Arc::new(TT::new(hash_mb)), Arc::new(AtomicBool::new(false)), true)
@@ -940,7 +984,10 @@ impl Searcher {
             killers: [[0; 2]; MAX_PLY],
             history: vec![0i16; HIST_SIZE],
             counter: [[[0; 64]; 64]; 2],
-            cont: vec![0i16; CONT_BLOCKS * CONT_STRIDE],
+            // Only the live blocks are allocated: CONT_EXTRA=false means `cont_blocks()` is 2, but
+            // this used to reserve CONT_BLOCKS (4), wasting 2 blocks x 385 x 384 x 2 bytes per
+            // Searcher and zeroing them in new_game. (F8, 2026-09-17.)
+            cont: vec![0i16; cont_blocks() * CONT_STRIDE],
             corr: vec![0i32; 2 * CORR_SIZE],
             capt: vec![0i16; CAPT_SIZE],
             capt_buf: (0..MAX_PLY + 4).map(|_| Vec::with_capacity(32)).collect(),
@@ -998,10 +1045,15 @@ impl Searcher {
         if self.stopped {
             return true;
         }
+        // The node budget is a cheap exact comparison and is checked every call, so `go nodes N`
+        // stops at N rather than at the next 2048-boundary. Only the atomic flag and the clock --
+        // both far more expensive -- stay on the 2048 throttle. (F13, 2026-09-17.)
+        if self.nodes >= self.max_nodes {
+            self.stopped = true;
+            return true;
+        }
         if self.nodes % 2048 == 0
-            && (self.stop.load(Ordering::Relaxed)
-                || self.nodes >= self.max_nodes
-                || self.start.elapsed().as_millis() > self.hard_ms)
+            && (self.stop.load(Ordering::Relaxed) || self.start.elapsed().as_millis() > self.hard_ms)
         {
             self.stopped = true;
         }
@@ -1087,10 +1139,10 @@ impl Searcher {
     #[inline]
     fn eval_node(&self, board: &Board, acc: Option<&nnue::Acc>) -> i32 {
         // 2026-09-11 (readiness audit R2): K+B vs K measured score cp 160 -- the engine
-        // believed it was better by 1.6 pawns in a position it cannot win, and played on,
-        // spending clock. The popcount gate means every real position pays one `len()` and a
-        // predictable not-taken branch.
-        if insufficient_material(board) {
+        // believed it was better by 1.6 pawns in a position it cannot win. The exact draws are now
+        // terminal (F5), so only the drawish-but-not-dead case is adjusted here. The popcount gate
+        // means every real position pays one `len()` and a predictable not-taken branch.
+        if is_drawish_material(board) {
             return 0;
         }
         match acc {
@@ -1140,10 +1192,12 @@ impl Searcher {
     ///    bound, so it is evidence the eval was too low and evidence of nothing at all if the
     ///    eval was already higher. Symmetrically for fail-low. Without this the table learns
     ///    from bounds that never constrained anything.
+    #[allow(clippy::too_many_arguments)]
     fn update_corr(
         &mut self,
         corr_ci: usize,
         static_eval: i32,
+        raw_eval: i32,
         best: i32,
         bound: u8,
         depth: i32,
@@ -1152,14 +1206,15 @@ impl Searcher {
         if !CORR_HIST || best_is_capture || best.abs() >= MATE_BOUND {
             return;
         }
+        // The bound guards compare against the CORRECTED eval, because that is what the search's
+        // pruning decisions used. (F4, 2026-09-17.)
         if (bound == BOUND_LOWER && best <= static_eval)
             || (bound == BOUND_UPPER && best >= static_eval)
         {
             return;
         }
         let w = depth.clamp(1, CORR_W_MAX);
-        let target = (best - static_eval).clamp(-CORR_MAX / CORR_GRAIN, CORR_MAX / CORR_GRAIN)
-            * CORR_GRAIN;
+        let target = corr_target_cp(best, static_eval, raw_eval, CORR_RAW_TARGET) * CORR_GRAIN;
         let e = &mut self.corr[corr_ci];
         *e = (*e * (CORR_W - w) + target * w) / CORR_W;
         *e = (*e).clamp(-CORR_MAX, CORR_MAX);
@@ -1181,6 +1236,27 @@ impl Searcher {
         }
         let stm = board.side_to_move();
         let in_check = !board.checkers().is_empty();
+        let hash = board.hash();
+        let repetition_hash = repetition_hash_from(board, hash);
+
+        // Terminal handling (F2, 2026-09-17). qsearch previously had no fifty-move or repetition
+        // check, and detected no-legal-move only when in check, so a stalemate at the horizon was
+        // scored as a normal stand-pat and a drawn position as live. Checkmate takes precedence
+        // over any draw, so a draw-triggering node that is in check and has no evasion returns
+        // mate. These path-dependent values are returned before the TT store below, so they are
+        // never cached as universally exact.
+        if board.halfmove_clock() >= 100
+            || (ply > 0 && self.is_repetition(repetition_hash, board.halfmove_clock()))
+        {
+            if in_check && !board.generate_moves(|_| true) {
+                return -MATE + ply;
+            }
+            return 0;
+        }
+        // F5: exact material draws are terminal here too, so qsearch does not score them live.
+        if is_dead_material(board) {
+            return 0;
+        }
 
         // Transposition probe + store (2026-09-09). qsearch had neither -- the single largest
         // standard omission in this search: quiescence is ~63% of all nodes (216481 of 343299
@@ -1207,7 +1283,6 @@ impl Searcher {
         //
         // The MOVE hint is taken from any entry at any depth: it is only an ordering
         // suggestion, is checked against generated moves, and cannot return a score.
-        let hash = board.hash();
         let mut tt_mv: u16 = 0;
         if QS_TT {
             if let Some(e) = self.tt.probe(hash) {
@@ -1316,9 +1391,18 @@ impl Searcher {
             false
         });
 
-        if in_check && moves.is_empty() {
-            self.qmove_buf[ply as usize] = moves;
-            return -MATE + ply;
+        if moves.is_empty() {
+            if in_check {
+                self.qmove_buf[ply as usize] = moves;
+                return -MATE + ply;
+            }
+            // No tactical moves is not the same as no legal moves. A stalemate would be scored
+            // by the stand-pat as an ordinary position; ask for one legal move before trusting
+            // it. The generator stops at the first move, so this is cheap whenever moves exist.
+            if !board.generate_moves(|_| true) {
+                self.qmove_buf[ply as usize] = moves;
+                return 0;
+            }
         }
         moves.sort_unstable_by_key(|&(s, _, _)| -s);
 
@@ -1348,7 +1432,10 @@ impl Searcher {
                 None
             };
             let nacc = acc.map(|a| self.update_acc(a, board, mv, qmoved, qvictim));
+            // qsearch now participates in the repetition path so the child can see it.
+            self.path.push(repetition_hash);
             let sc = -self.qsearch(&nb, ply + 1, -beta, -alpha, nacc.as_ref());
+            self.path.pop();
             if self.stopped {
                 self.qmove_buf[ply as usize] = moves;
                 return best.max(sc);
@@ -1439,16 +1526,28 @@ impl Searcher {
         }
         let hash = board.hash();
         let repetition_hash = repetition_hash_from(board, hash);
+        let in_check = !board.checkers().is_empty();
         if ply > 0 {
             if board.halfmove_clock() >= 100
                 || self.is_repetition(repetition_hash, board.halfmove_clock())
             {
                 self.nodes += 1;
+                // A draw claim never takes precedence over checkmate. If the side to move is in
+                // check and has no legal evasion, the game ended at checkmate, not at a
+                // fifty-move or repetition draw. Only the rare draw-triggering node pays for
+                // move generation, and only while in check.
+                if in_check && !board.generate_moves(|_| true) {
+                    return -MATE + ply;
+                }
                 return 0;
             }
         }
-
-        let in_check = !board.checkers().is_empty();
+        // F5: exact draws by material are terminal, so the engine neither searches nor lets
+        // correction history shift a position nobody can win.
+        if is_dead_material(board) {
+            self.nodes += 1;
+            return 0;
+        }
         if in_check {
             // Check extension. Uncapped, a forcing sequence can extend a line indefinitely --
             // harmless at bench depth 11, much less so at the ~depth 22-25 a 40/15 search
@@ -2167,7 +2266,7 @@ impl Searcher {
             // same exclusion, same reason: a verification score describes a different position,
             // and `in_check` is already known false here (checks went to qsearch at the top).
             if !in_check {
-                self.update_corr(corr_ci, static_eval, best, bound, depth, best_is_capture);
+                self.update_corr(corr_ci, static_eval, raw_eval, best, bound, depth, best_is_capture);
             }
         }
         // Give the buffers back for reuse, including across successive go commands.
@@ -2346,6 +2445,12 @@ impl Searcher {
             if score.abs() > MATE_BOUND && depth > 2 * (MATE - score.abs()) {
                 break; // mate found with margin; stop burning time
             }
+        }
+        // F12 (2026-09-17): `go infinite` must retain the UCI lifecycle. A search that finishes
+        // on its own -- a proven mate, or the ply cap -- must not emit `bestmove` until the GUI
+        // sends `stop` (or `quit`). Idle cheaply rather than busy-waiting.
+        while limits.infinite && !self.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         best
     }
@@ -3032,5 +3137,100 @@ mod tm_tests {
                 assert!(hard >= 1 && soft <= hard, "t={t} mtg={mtg:?} -> ({soft},{hard})");
             }
         }
+    }
+}
+
+/// Regression tests for terminal precedence and qsearch draw handling (audit F1/F2, 2026-09-17).
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    /// F1: a halfmove-clock draw must not override checkmate. At clock 100 the side to move is
+    /// checkmated; before the fix this returned 0 (draw).
+    #[test]
+    fn fifty_move_draw_does_not_override_checkmate() {
+        let board = Board::from_fen("7k/6Q1/5K2/8/8/8/8/8 b - - 100 1", false).unwrap();
+        let mut s = Searcher::new(1);
+        let score = s.negamax(&board, 2, 1, -INF, INF, 0, None, false);
+        assert_eq!(
+            score,
+            -MATE + 1,
+            "checkmate must take precedence over the fifty-move rule"
+        );
+    }
+
+    /// F1: the same position as a mate-in-one, where the mating move lands the clock on 100.
+    #[test]
+    fn a_mating_move_is_found_at_the_move_count_boundary() {
+        let board = Board::from_fen("7k/8/5KQ1/8/8/8/8/8 w - - 99 1", false).unwrap();
+        let mut s = Searcher::new(1);
+        let score = s.negamax(&board, 3, 0, -INF, INF, 0, None, false);
+        assert!(score > MATE_BOUND, "expected a mate score, got {score}");
+    }
+
+    /// F2: qsearch must score a stalemate as 0, not as a stand-pat.
+    #[test]
+    fn qsearch_scores_stalemate_as_zero() {
+        let board = Board::from_fen("7k/5K2/6Q1/8/8/8/8/8 b - - 0 1", false).unwrap();
+        let mut s = Searcher::new(1);
+        let score = s.qsearch(&board, 1, -INF, INF, None);
+        assert_eq!(score, 0, "stalemate must be a draw, got {score}");
+    }
+
+    /// F2: qsearch must score a fifty-move boundary position as 0.
+    #[test]
+    fn qsearch_scores_the_move_count_boundary_as_zero() {
+        let board = Board::from_fen("7k/8/5KQ1/8/8/8/8/8 b - - 100 1", false).unwrap();
+        let mut s = Searcher::new(1);
+        let score = s.qsearch(&board, 1, -INF, INF, None);
+        assert_eq!(score, 0, "the fifty-move rule must be a draw, got {score}");
+    }
+}
+
+/// F4: the correction target must be the residual against the RAW eval when the experiment is
+/// enabled, and the legacy corrected target otherwise (2026-09-17).
+#[cfg(test)]
+mod correction_tests {
+    use super::*;
+
+    /// Iterate the correction recurrence for `use_raw`; returns the converged correction in cp.
+    fn converged_cp(use_raw: bool) -> i32 {
+        let mut c_cp = 0i32; // the corrected eval, raw 0 plus the learned correction
+        for _ in 0..1000 {
+            let target = corr_target_cp(100, c_cp, 0, use_raw) * CORR_GRAIN;
+            let e = c_cp * CORR_GRAIN;
+            c_cp = (e * (CORR_W - 8) + target * 8) / CORR_W / CORR_GRAIN;
+        }
+        c_cp
+    }
+
+    #[test]
+    fn correction_target_uses_the_raw_eval_when_enabled() {
+        // Raw eval 0, searched score 100. With the raw target the table learns the full residual;
+        // the legacy target is itself corrected, so it iterates to half the bias.
+        assert_eq!(corr_target_cp(100, 0, 0, true), 100);
+        let raw = converged_cp(true);
+        let legacy = converged_cp(false);
+        assert!((raw - 100).abs() <= 1, "raw target converged to {raw}, expected 100");
+        assert!((legacy - 50).abs() <= 1, "legacy target converged to {legacy}, expected 50");
+    }
+}
+
+/// F5: exact material draws are terminal, drawish-but-winnable ones are not (2026-09-17).
+#[cfg(test)]
+mod material_tests {
+    use super::*;
+
+    #[test]
+    fn dead_material_is_terminal_but_knn_is_not() {
+        let kb = Board::from_fen("8/8/8/4k3/8/8/2B5/4K3 w - - 0 1", false).unwrap();
+        assert!(is_dead_material(&kb), "K+B vs K is an exact draw");
+        let mut s = Searcher::new(1);
+        assert_eq!(s.negamax(&kb, 3, 1, -INF, INF, 0, None, false), 0);
+        assert_eq!(s.qsearch(&kb, 1, -INF, INF, None), 0);
+
+        let knn = Board::from_fen("8/8/8/4k3/8/8/2N5/2N1K3 w - - 0 1", false).unwrap();
+        assert!(!is_dead_material(&knn), "KNN vs K is unforceable, not impossible");
+        assert!(is_drawish_material(&knn));
     }
 }

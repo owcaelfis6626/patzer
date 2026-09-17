@@ -65,6 +65,11 @@ impl Network {
 static NET: OnceLock<Network> = OnceLock::new();
 
 pub fn load_global(path: &str) -> Result<(), String> {
+    // Reject before parsing: a repeated EvalFile must not re-read the whole file just to
+    // discover that a network is already loaded and cannot be replaced. (F14, 2026-09-17.)
+    if NET.get().is_some() {
+        return Err("EvalFile already loaded (network reload is not supported)".to_string());
+    }
     let net = load(path)?;
     NET.set(net).map_err(|_| "EvalFile already loaded".to_string())?;
     Ok(())

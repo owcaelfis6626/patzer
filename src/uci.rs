@@ -64,6 +64,7 @@ pub fn uci_loop() {
         | 1;
 
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut warned_no_net = false;
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = match line {
@@ -97,19 +98,28 @@ pub fn uci_loop() {
                 ) {
                     if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("hash")) == Some(true) {
                         if let Some(mb) = tokens.get(vi + 1).and_then(|v| v.parse::<usize>().ok()) {
-                            hash_mb = mb;
-                            let (new_tt, new_pool) = build_pool(hash_mb, n_threads, &stop);
-                            tt = new_tt;
-                            pool = new_pool;
+                            // Clamp to the advertised range and skip a no-op rebuild: an
+                            // out-of-range or unchanged value must not reallocate the table.
+                            // (F14, 2026-09-17.)
+                            let mb = mb.clamp(1, 4096);
+                            if mb != hash_mb {
+                                hash_mb = mb;
+                                let (new_tt, new_pool) = build_pool(hash_mb, n_threads, &stop);
+                                tt = new_tt;
+                                pool = new_pool;
+                            }
                         }
                     } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("threads"))
                         == Some(true)
                     {
                         if let Some(n) = tokens.get(vi + 1).and_then(|v| v.parse::<usize>().ok()) {
-                            n_threads = n.max(1);
-                            let (new_tt, new_pool) = build_pool(hash_mb, n_threads, &stop);
-                            tt = new_tt;
-                            pool = new_pool;
+                            let n = n.clamp(1, 256);
+                            if n != n_threads {
+                                n_threads = n;
+                                let (new_tt, new_pool) = build_pool(hash_mb, n_threads, &stop);
+                                tt = new_tt;
+                                pool = new_pool;
+                            }
                         }
                     } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("ownbook"))
                         == Some(true)
@@ -132,8 +142,11 @@ pub fn uci_loop() {
                     } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("evalfile"))
                         == Some(true)
                     {
-                        if let Some(path) = tokens.get(vi + 1) {
-                            match crate::nnue::load_global(path) {
+                        // Option values may contain spaces (a full path). Take every token after
+                        // `value`, not just the first. (F14, 2026-09-17.)
+                        let path = tokens[vi + 1..].join(" ");
+                        if !path.is_empty() {
+                            match crate::nnue::load_global(&path) {
                                 Ok(()) => println!("info string NNUE loaded: {path}"),
                                 Err(e) => println!("info string NNUE load failed: {e}"),
                             }
@@ -141,9 +154,18 @@ pub fn uci_loop() {
                     } else if tokens.get(ni + 1).map(|s| s.eq_ignore_ascii_case("policyfile"))
                         == Some(true)
                     {
-                        if let Some(path) = tokens.get(vi + 1) {
-                            match crate::policy::load_global(path) {
-                                Ok(()) => println!("info string policy loaded: {path}"),
+                        let path = tokens[vi + 1..].join(" ");
+                        if !path.is_empty() {
+                            match crate::policy::load_global(&path) {
+                                Ok(()) => {
+                                    println!("info string policy loaded: {path}");
+                                    if crate::nnue::net().is_none() {
+                                        println!(
+                                            "info string warning: policy loaded without an NNUE \
+                                             net; quiet policy ordering will not engage"
+                                        );
+                                    }
+                                }
                                 Err(e) => println!("info string policy load failed: {e}"),
                             }
                         }
@@ -259,6 +281,15 @@ pub fn uci_loop() {
                     println!("info string no valid position");
                     println!("bestmove 0000");
                     continue;
+                }
+                // Make a missing net loud once, rather than letting a deployment run the PeSTO
+                // fallback silently. (F14, 2026-09-17.)
+                if !warned_no_net && crate::nnue::net().is_none() {
+                    warned_no_net = true;
+                    println!(
+                        "info string warning: no NNUE net loaded, using the PeSTO fallback \
+                         evaluator"
+                    );
                 }
                 // book probe: instant reply while the position is in repertoire
                 if own_book && !tokens.contains(&"infinite") {

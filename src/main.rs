@@ -294,8 +294,15 @@ fn fwdgate(net_path: &str, data_path: &str, limit: usize) {
     println!("GATE fwd — AVX2 forward vs scalar reference, real net, real positions");
     let net = nnue::load(net_path).expect("cannot load net");
     let data = std::fs::read(data_path).expect("cannot read dataset");
+    assert!(
+        data.len().is_multiple_of(datagen::RECORD_SIZE),
+        "dataset size {} is not a multiple of the {}-byte record",
+        data.len(),
+        datagen::RECORD_SIZE
+    );
     let n = (data.len() / datagen::RECORD_SIZE).min(limit);
     let mut mismatches = 0usize;
+    let mut valid = 0usize;
     let mut first: Option<(usize, i32, i32, String)> = None;
     for i in 0..n {
         let pos: [u8; 27] = data[i * datagen::RECORD_SIZE..i * datagen::RECORD_SIZE + 27]
@@ -306,6 +313,7 @@ fn fwdgate(net_path: &str, data_path: &str, limit: usize) {
             Ok(b) => b,
             Err(_) => continue,
         };
+        valid += 1;
         let acc = nnue::acc_from(&net, &board);
         let stm = board.side_to_move();
         let fast = nnue::forward(&net, &acc.w, &acc.b, stm);
@@ -317,7 +325,12 @@ fn fwdgate(net_path: &str, data_path: &str, limit: usize) {
             }
         }
     }
-    println!("  {n} positions | {mismatches} mismatches");
+    println!("  {n} records, {valid} valid positions compared, {mismatches} mismatches");
+    if valid == 0 {
+        println!("  no valid positions compared — an empty gate is not a pass");
+        println!("  => GATE FAIL");
+        std::process::exit(1);
+    }
     if let Some((i, fast, want, fen)) = first {
         println!("  first at #{i}: avx2 {fast} vs scalar {want}   {fen}");
         println!("  => GATE FAIL");
@@ -474,6 +487,18 @@ fn see_gate() {
             "k7/8/4p3/3p4/8/8/3Q4/K7 w - - 0 1",
             "d2d5",
             82 - 1025, // queen falls to the pawn recapture
+        ),
+        (
+            "ep opens a rook file",
+            "k7/8/8/3pP3/3r4/8/8/K7 w - d6 0 1",
+            "e5d6",
+            0, // the ep capture clears d5, so d4xd6 recaptures: pawn for pawn (F3)
+        ),
+        (
+            "castling is not a capture",
+            "4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1",
+            "e1g1",
+            0, // king-takes-own-rook encoding must not credit our own piece (F17)
         ),
     ];
     let mut all_ok = true;
@@ -658,13 +683,30 @@ fn mates_gate() {
         let board = Board::from_fen(fen, false).expect("bad FEN");
         let t0 = std::time::Instant::now();
         let ok = verify_mate(&board, *n);
-        all_ok &= ok;
+        // The walker proves the MOVE mates; also require the engine to SAY mate, so a bogus
+        // score cannot pass unseen. (F17, 2026-09-17.)
+        let mut s = Searcher::new(16);
+        s.silent = true;
+        s.think(
+            &board,
+            &Limits {
+                depth: Some(2 * n + 2),
+                nodes: Some(5_000_000),
+                ..Default::default()
+            },
+        );
+        let said_mate = s.last_score > search::MATE - 512;
+        all_ok &= ok && said_mate;
         println!(
             "  {:<12} mate-in-{}  {:>7.2?}  {}",
             name,
             n,
             t0.elapsed(),
-            if ok { "PASS (proven)" } else { "FAIL" }
+            match (ok, said_mate) {
+                (true, true) => "PASS (proven + score)",
+                (true, false) => "FAIL (move mates, score did not)",
+                _ => "FAIL",
+            }
         );
     }
     println!("  => {}", if all_ok { "GATE PASS" } else { "GATE FAIL" });
@@ -687,11 +729,16 @@ fn bench() {
         .unwrap_or(DEPTH);
     println!("BENCH — fixed depth {depth}, fresh TT per position; total nodes = functional signature");
     let mut total_nodes = 0u64;
+    let mut construct = std::time::Duration::ZERO;
+    let mut search = std::time::Duration::ZERO;
     let t0 = std::time::Instant::now();
     for (name, fen, _) in PERFT_SUITE {
         let board = Board::from_fen(fen, false).expect("bad FEN");
+        let c0 = std::time::Instant::now();
         let mut s = Searcher::new(64);
         s.silent = true;
+        construct += c0.elapsed();
+        let s0 = std::time::Instant::now();
         let mv = s.think(
             &board,
             &Limits {
@@ -699,6 +746,7 @@ fn bench() {
                 ..Default::default()
             },
         );
+        search += s0.elapsed();
         total_nodes += s.nodes;
         println!(
             "  {:<15} nodes {:>10}  best {}",
@@ -709,11 +757,18 @@ fn bench() {
         );
     }
     let secs = t0.elapsed().as_secs_f64();
+    let ss = search.as_secs_f64();
+    // Construction (a fresh 64 MiB TT + Searcher per position) happens inside the timed interval
+    // and is ~25% of it, so report it separately rather than letting throughput be read as
+    // search-only. (F7, 2026-09-17.)
     println!(
-        "  SIGNATURE: {} nodes | {:.2}s | {:.0} knps",
+        "  SIGNATURE: {} nodes | total {:.2}s ({:.0} knps) | construct {:.2}s | search {:.2}s ({:.0} knps search-only)",
         total_nodes,
         secs,
-        total_nodes as f64 / secs / 1e3
+        total_nodes as f64 / secs / 1e3,
+        construct.as_secs_f64(),
+        ss,
+        total_nodes as f64 / ss / 1e3
     );
 }
 

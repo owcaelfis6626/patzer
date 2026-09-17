@@ -298,6 +298,9 @@ fn run_datagen(
     threads: usize,
     seed_positions: Option<Vec<Board>>,
 ) {
+    // A zero-worker run would start nothing and still print a successful DONE line. (F16.7.)
+    assert!(threads > 0, "datagen needs at least one worker thread");
+    assert!(games > 0, "datagen needs at least one game");
     let seed_positions = &seed_positions;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -542,6 +545,32 @@ fn run_datagen(
 /// The ceiling is still what our search knows, so this is not free information. It is not
 /// circular either: our search at 5,000 nodes on a position we would never REACH is genuinely
 /// new to the net, and its error there is real and correctable.
+/// Validate a packed record before it is unpacked. `unpack_to_fen` indexes the literal
+/// `"pnbrqk"` with a 3-bit piece code, so a nibble of 6 or 7 panics; a malformed record must be
+/// rejected rather than allowed to abort a worker and leave a zero-filled output partition.
+/// Returns the piece count on success. (F15, 2026-09-17.)
+fn validate_packed(pos: &[u8; 27]) -> Result<usize, String> {
+    let occ = u64::from_le_bytes(pos[0..8].try_into().unwrap());
+    let pieces = occ.count_ones() as usize;
+    if pieces > 32 {
+        return Err(format!("{pieces} occupancy bits"));
+    }
+    let mut i = 0usize;
+    for s in 0..64u32 {
+        if occ >> s & 1 == 1 {
+            let code = (pos[8 + i / 2] >> (4 * (i % 2))) & 0xF;
+            if (code & 7) >= 6 {
+                return Err(format!("bad piece code {code} at square {s}"));
+            }
+            if code >> 3 > 1 {
+                return Err(format!("bad colour in code {code} at square {s}"));
+            }
+            i += 1;
+        }
+    }
+    Ok(pieces)
+}
+
 pub fn rescore(in_path: &str, out_path: &str, threads: usize, limit: usize) {
     let data = std::fs::read(in_path).expect("cannot read dataset");
     assert!(data.len() % RECORD_SIZE == 0, "bad record size");
@@ -562,25 +591,45 @@ pub fn rescore(in_path: &str, out_path: &str, threads: usize, limit: usize) {
             break;
         }
         let (data, out, done) = (data.clone(), out.clone(), done.clone());
-        handles.push(std::thread::spawn(move || {
+        handles.push(std::thread::spawn(move || -> Result<(usize, usize), String> {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let tt = std::sync::Arc::new(crate::tt::TT::new(16));
             let mut s = Searcher::for_thread(tt, stop, true);
             s.silent = true;
             let mut local = vec![0u8; (hi - lo) * RECORD_SIZE];
+            let mut rejected = 0usize;
             for i in lo..hi {
                 let rec = &data[i * RECORD_SIZE..(i + 1) * RECORD_SIZE];
                 let pos: [u8; 27] = rec[0..27].try_into().unwrap();
                 let mut r = [0u8; RECORD_SIZE];
                 r.copy_from_slice(rec);
-                if let Ok(board) = Board::from_fen(&unpack_to_fen(&pos), false) {
-                    let mv = s.think(&board, &Limits { nodes: Some(NODES_PER_MOVE), ..Default::default() });
-                    let sc = s.last_score.clamp(-MAX_SCORE_CP, MAX_SCORE_CP) as i16;
-                    r[27..29].copy_from_slice(&sc.to_le_bytes());       // our score
-                    if let Some(m) = mv {
-                        r[30..32].copy_from_slice(&pack(m).to_le_bytes()); // our best move
+                match validate_packed(&pos) {
+                    Ok(_) => match Board::from_fen(&unpack_to_fen(&pos), false) {
+                        Ok(board) => {
+                            let mv = s.think(
+                                &board,
+                                &Limits { nodes: Some(NODES_PER_MOVE), ..Default::default() },
+                            );
+                            let sc = s.last_score.clamp(-MAX_SCORE_CP, MAX_SCORE_CP) as i16;
+                            r[27..29].copy_from_slice(&sc.to_le_bytes()); // our score
+                            if let Some(m) = mv {
+                                r[30..32].copy_from_slice(&pack(m).to_le_bytes()); // our best move
+                            }
+                            // r[29] (wdl) deliberately untouched -- it is the real game result
+                        }
+                        Err(e) => {
+                            rejected += 1;
+                            if rejected <= 5 {
+                                eprintln!("rescore: rejecting record {i}: unparsable FEN: {e}");
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        rejected += 1;
+                        if rejected <= 5 {
+                            eprintln!("rescore: rejecting record {i}: {e}");
+                        }
                     }
-                    // r[29] (wdl) deliberately untouched -- it is the real game result
                 }
                 local[(i - lo) * RECORD_SIZE..(i - lo + 1) * RECORD_SIZE].copy_from_slice(&r);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -590,12 +639,39 @@ pub fn rescore(in_path: &str, out_path: &str, threads: usize, limit: usize) {
                 }
             }
             out.lock().unwrap()[lo * RECORD_SIZE..hi * RECORD_SIZE].copy_from_slice(&local);
+            Ok((hi - lo, rejected))
         }));
     }
+    let mut processed = 0usize;
+    let mut rejected = 0usize;
+    let mut failed: Option<String> = None;
     for h in handles {
-        let _ = h.join();
+        match h.join() {
+            Ok(Ok((p, r))) => {
+                processed += p;
+                rejected += r;
+            }
+            Ok(Err(e)) => failed = Some(e),
+            Err(_) => failed = Some("worker thread panicked".to_string()),
+        }
     }
-    std::fs::write(out_path, &*out.lock().unwrap()).expect("cannot write");
+    // Fail closed: a rejected record or a dead worker must not leave a published partial output.
+    if let Some(e) = failed {
+        eprintln!("rescore: FAILED: {e}");
+        std::process::exit(1);
+    }
+    if rejected > 0 {
+        eprintln!("rescore: {rejected} record(s) rejected; refusing to publish a partial relabel");
+        std::process::exit(1);
+    }
+    if processed != n {
+        eprintln!("rescore: processed {processed} of {n}; refusing to publish");
+        std::process::exit(1);
+    }
+    // Publish atomically: write a temp file and rename only after every worker succeeded.
+    let tmp = format!("{out_path}.tmp");
+    std::fs::write(&tmp, &*out.lock().unwrap()).expect("cannot write temp output");
+    std::fs::rename(&tmp, out_path).expect("cannot rename temp output");
     println!("rescore: wrote {n} records -> {out_path}");
 }
 

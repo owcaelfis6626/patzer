@@ -76,6 +76,11 @@ impl Book {
             for tok in line.split_whitespace() {
                 let mv = parse_uci_move(&board, tok)
                     .map_err(|e| format!("book line '{line}': move {tok}: {e}"))?;
+                // Parsing is not legality. Reject a parsed-but-illegal move so this really is a
+                // legality walk, as its documentation claims. (F17, 2026-09-17.)
+                if !board.is_legal(mv) {
+                    return Err(format!("book line '{line}': move {tok} is illegal here"));
+                }
                 let mover_covered = match side {
                     '*' => true,
                     'w' => board.side_to_move() == Color::White,

@@ -19,6 +19,10 @@ pub struct Policy {
 static POLICY: OnceLock<Policy> = OnceLock::new();
 
 pub fn load_global(path: &str) -> Result<(), String> {
+    // Reject before parsing, for the same reason as the eval net. (F14, 2026-09-17.)
+    if POLICY.get().is_some() {
+        return Err("PolicyFile already loaded (policy reload is not supported)".to_string());
+    }
     let p = load(path)?;
     POLICY.set(p).map_err(|_| "PolicyFile already loaded".to_string())?;
     Ok(())
