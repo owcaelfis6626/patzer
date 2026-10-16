@@ -91,13 +91,7 @@ go wtime 900000 btime 900000 movestogo 40
 this engine has been measured under disables it, and a default nothing is tested
 under is not a safe default.
 
-## Strength
 
-Measured at −21.74 ± 25.62 over 400 games against Stash v26 (CCRL blitz 3000) at
-20+0.2, so roughly 2980, in August 2026. A further +160 ± 26 has been measured in
-self-play since; that figure has **not** been re-anchored against a foreign
-opponent, and self-play gains are not strength gains until something outside the
-family confirms them.
 
 ## License
 
